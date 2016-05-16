@@ -38,9 +38,9 @@ elseif("${COMPILER_VERSION_FULL}" MATCHES ".*clang-7")
   set(COMPILER_VERSION "3.7.0svn")
 
 # gcc
-elseif("${COMPILER_VERSION_FULL}" MATCHES ".*gcc version.*")
+elseif("${COMPILER_VERSION_FULL}" MATCHES ".*gcc 版本.*" )
   set(COMPILER_FAMILY "gcc")
-  string(REGEX REPLACE ".*gcc version ([0-9\\.]+).*" "\\1"
+  string(REGEX REPLACE ".*gcc 版本 ([0-9\\.]+).*" "\\1"
     COMPILER_VERSION "${COMPILER_VERSION_FULL}")
 else()
   message(FATAL_ERROR "Unknown compiler. Version info:\n${COMPILER_VERSION_FULL}")
