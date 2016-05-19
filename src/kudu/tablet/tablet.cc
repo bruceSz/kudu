@@ -68,11 +68,6 @@
 #include "kudu/util/trace.h"
 #include "kudu/util/url-coding.h"
 
-DEFINE_bool(tablet_do_dup_key_checks, true,
-            "Whether to check primary keys for duplicate on insertion. "
-            "Use at your own risk!");
-TAG_FLAG(tablet_do_dup_key_checks, unsafe);
-
 DEFINE_int32(tablet_compaction_budget_mb, 128,
              "Budget for a single compaction");
 TAG_FLAG(tablet_compaction_budget_mb, experimental);
@@ -389,54 +384,92 @@ void Tablet::StartTransaction(WriteTransactionState* tx_state) {
   tx_state->SetMvccTxAndTimestamp(std::move(mvcc_tx));
 }
 
-Status Tablet::InsertUnlocked(WriteTransactionState *tx_state,
-                              RowOp* insert,
-                              ProbeStats* stats) {
+Status Tablet::InsertOrUpsertUnlocked(WriteTransactionState *tx_state,
+                                      RowOp* op,
+                                      ProbeStats* stats) {
+  const bool is_upsert = op->decoded_op.type == RowOperationsPB::UPSERT;
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
 
-  CHECK(state_ == kOpen || state_ == kBootstrapping);
-  // make sure that the WriteTransactionState has the component lock and that
-  // there the RowOp has the row lock.
-  DCHECK(insert->has_row_lock()) << "RowOp must hold the row lock.";
-  DCHECK_EQ(tx_state->schema_at_decode_time(), schema()) << "Raced against schema change";
-  DCHECK(tx_state->op_id().IsInitialized()) << "TransactionState OpId needed for anchoring";
-
   // First, ensure that it is a unique key by checking all the open RowSets.
-  if (FLAGS_tablet_do_dup_key_checks) {
-    vector<RowSet *> to_check;
-    comps->rowsets->FindRowSetsWithKeyInRange(insert->key_probe->encoded_key_slice(),
-                                              &to_check);
+  vector<RowSet *> to_check;
+  comps->rowsets->FindRowSetsWithKeyInRange(op->key_probe->encoded_key_slice(),
+                                            &to_check);
 
-    for (const RowSet *rowset : to_check) {
-      bool present = false;
-      RETURN_NOT_OK(rowset->CheckRowPresent(*insert->key_probe, &present, stats));
-      if (PREDICT_FALSE(present)) {
-        Status s = Status::AlreadyPresent("key already present");
-        if (metrics_) {
-          metrics_->insertions_failed_dup_key->Increment();
-        }
-        insert->SetFailed(s);
-        return s;
+  for (RowSet *rowset : to_check) {
+    bool present = false;
+    RETURN_NOT_OK(rowset->CheckRowPresent(*op->key_probe, &present, stats));
+    if (present) {
+      if (is_upsert) {
+        return ApplyUpsertAsUpdate(tx_state, op, rowset, stats);
       }
+      Status s = Status::AlreadyPresent("key already present");
+      if (metrics_) {
+        metrics_->insertions_failed_dup_key->Increment();
+      }
+      op->SetFailed(s);
+      return s;
     }
   }
 
   Timestamp ts = tx_state->timestamp();
-  ConstContiguousRow row(schema(), insert->decoded_op.row_data);
+  ConstContiguousRow row(schema(), op->decoded_op.row_data);
 
   // TODO: the Insert() call below will re-encode the key, which is a
   // waste. Should pass through the KeyProbe structure perhaps.
 
-  // Now try to insert into memrowset. The memrowset itself will return
-  // AlreadyPresent if it has already been inserted there.
+  // Now try to op into memrowset. The memrowset itself will return
+  // AlreadyPresent if it has already been oped there.
   Status s = comps->memrowset->Insert(ts, row, tx_state->op_id());
-  if (PREDICT_TRUE(s.ok())) {
-    insert->SetInsertSucceeded(comps->memrowset->mrs_id());
+  if (s.ok()) {
+    op->SetInsertSucceeded(comps->memrowset->mrs_id());
   } else {
-    if (s.IsAlreadyPresent() && metrics_) {
-      metrics_->insertions_failed_dup_key->Increment();
+    if (s.IsAlreadyPresent()) {
+      if (is_upsert) {
+        return ApplyUpsertAsUpdate(tx_state, op, comps->memrowset.get(), stats);
+      }
+      if (metrics_) {
+        metrics_->insertions_failed_dup_key->Increment();
+      }
     }
-    insert->SetFailed(s);
+    op->SetFailed(s);
+  }
+  return s;
+}
+
+Status Tablet::ApplyUpsertAsUpdate(WriteTransactionState* tx_state,
+                                   RowOp* upsert,
+                                   RowSet* rowset,
+                                   ProbeStats* stats) {
+  const auto* schema = this->schema();
+  ConstContiguousRow row(schema, upsert->decoded_op.row_data);
+  faststring buf;
+  RowChangeListEncoder enc(&buf);
+  for (int i = 0; i < schema->num_columns(); i++) {
+    if (schema->is_key_column(i)) continue;
+
+    // If the user didn't explicitly set this column in the UPSERT, then we should
+    // not turn it into an UPDATE. This prevents the UPSERT from updating
+    // values back to their defaults when unset.
+    if (!BitmapTest(upsert->decoded_op.isset_bitmap, i)) continue;
+    const auto& c = schema->column(i);
+    const void* val = c.is_nullable() ? row.nullable_cell_ptr(i) : row.cell_ptr(i);
+    enc.AddColumnUpdate(c, schema->column_id(i), val);
+  }
+
+  RowChangeList rcl = enc.as_changelist();
+
+  gscoped_ptr<OperationResultPB> result(new OperationResultPB());
+  Status s = rowset->MutateRow(tx_state->timestamp(),
+                               *upsert->key_probe,
+                               rcl,
+                               tx_state->op_id(),
+                               stats,
+                               result.get());
+  CHECK(!s.IsNotFound());
+  if (s.ok()) {
+    upsert->SetMutateSucceeded(std::move(result));
+  } else {
+    upsert->SetFailed(s);
   }
   return s;
 }
@@ -484,10 +517,6 @@ vector<RowSet*> Tablet::FindRowSetsToCheck(RowOp* mutate,
 Status Tablet::MutateRowUnlocked(WriteTransactionState *tx_state,
                                  RowOp* mutate,
                                  ProbeStats* stats) {
-  DCHECK(tx_state != nullptr) << "you must have a WriteTransactionState";
-  DCHECK(tx_state->op_id().IsInitialized()) << "TransactionState OpId needed for anchoring";
-  DCHECK_EQ(tx_state->schema_at_decode_time(), schema());
-
   gscoped_ptr<OperationResultPB> result(new OperationResultPB());
 
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
@@ -580,9 +609,16 @@ void Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
 void Tablet::ApplyRowOperation(WriteTransactionState* tx_state,
                                RowOp* row_op,
                                ProbeStats* stats) {
+  CHECK(state_ == kOpen || state_ == kBootstrapping);
+  DCHECK(row_op->has_row_lock()) << "RowOp must hold the row lock.";
+  DCHECK(tx_state != nullptr) << "must have a WriteTransactionState";
+  DCHECK(tx_state->op_id().IsInitialized()) << "TransactionState OpId needed for anchoring";
+  DCHECK_EQ(tx_state->schema_at_decode_time(), schema());
+
   switch (row_op->decoded_op.type) {
     case RowOperationsPB::INSERT:
-      ignore_result(InsertUnlocked(tx_state, row_op, stats));
+    case RowOperationsPB::UPSERT:
+      ignore_result(InsertOrUpsertUnlocked(tx_state, row_op, stats));
       return;
 
     case RowOperationsPB::UPDATE:

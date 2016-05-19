@@ -136,8 +136,8 @@ TEST_F(TabletServerTest, TestSetFlags) {
   // Try setting a flag which isn't runtime-modifiable
   {
     RpcController controller;
-    req.set_flag("tablet_do_dup_key_checks");
-    req.set_value("true");
+    req.set_flag("tablet_bloom_target_fp_rate");
+    req.set_value("1.0");
     ASSERT_OK(proxy.SetFlag(req, &resp, &controller));
     SCOPED_TRACE(resp.DebugString());
     EXPECT_EQ(server::SetFlagResponsePB::NOT_SAFE, resp.result());
@@ -146,8 +146,8 @@ TEST_F(TabletServerTest, TestSetFlags) {
   // Try again, but with the force flag.
   {
     RpcController controller;
-    req.set_flag("tablet_do_dup_key_checks");
-    req.set_value("true");
+    req.set_flag("tablet_bloom_target_fp_rate");
+    req.set_value("1.0");
     req.set_force(true);
     ASSERT_OK(proxy.SetFlag(req, &resp, &controller));
     SCOPED_TRACE(resp.DebugString());
@@ -1930,10 +1930,9 @@ TEST_F(TabletServerTest, TestDeleteTablet) {
                               &buf));
 
   // Verify data was actually removed.
-  // TODO(KUDU-678): this should be 0 but we leak an empty delta block.
   const int block_count_after_delete = ondisk->value();
   if (FLAGS_block_manager == "log") {
-    ASSERT_EQ(block_count_after_delete, 1);
+    ASSERT_EQ(block_count_after_delete, 0);
   }
 
   // Verify that after restarting the TS, the tablet is still not in the tablet manager.
