@@ -77,6 +77,8 @@ Hadoop storage technologies.
   using mapreduce api. Includes predicate pushdowns for spark-sql and spark filters.
   Parallel retrieval for multiple tablets and column projections. link:developing.html#_kudu_integration_with_spark[Kudu integration with Spark Example]
 
+- link:http://gerrit.cloudera.org:8080/#/c/2992/ Added ability to update and insert from spark using kudu datasource
+
 [[rn_0.9.0_changes]]
 ==== Other noteworthy changes
 
@@ -85,6 +87,12 @@ Hadoop storage technologies.
   is now 10 seconds instead of 5. For the C++ client, the default admin timeout is now 30 seconds
   instead of 10, the default RPC timeout is now 10 seconds instead of 5, and the default scan
   timeout is now 30 seconds instead of 15.
+
+- Some default settings related to I/O behavior during flushes and compactions have been changed:
+  The default for `flush_threshold_mb` has been increased from 64MB to 1000MB. The default
+  `cfile_do_on_finish` has been changed from `close` to `flush`.
+  link:http://getkudu.io/2016/04/26/ycsb.html[Experiments using YCSB] indicate that these
+  values will provide better throughput for write-heavy applications on typical server hardware.
 
 [[rn_0.8.0]]
 === Release notes specific to 0.8.0

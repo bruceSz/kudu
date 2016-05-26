@@ -18,6 +18,7 @@
 
 from kudu.compat import unittest, long
 from kudu.tests.common import KuduTestBase
+from kudu.client import Partitioning
 import kudu
 
 
@@ -92,12 +93,33 @@ class TestClient(KuduTestBase, unittest.TestCase):
         self.assertRaises(kudu.KuduNotFound, self.client.table,
                           '__donotexist__')
 
+    def test_create_partitioned_table(self):
+        name = 'partitioned_table'
+        try:
+            self.client.create_table(
+                name, self.schema,
+                partitioning=Partitioning().add_hash_partitions(['key'], 2))
+            # TODO: once the Python client can list partition info, assert that it was
+            # created successfully here.
+            self.client.delete_table(name)
+
+            self.client.create_table(
+                name, self.schema,
+                partitioning=Partitioning().set_range_partition_columns([]))
+            self.client.delete_table(name)
+
+        finally:
+            try:
+                self.client.delete_table(name)
+            except:
+                pass
+
     def test_insert_nonexistent_field(self):
         table = self.client.table(self.ex_table)
         op = table.new_insert()
         self.assertRaises(KeyError, op.__setitem__, 'doesntexist', 12)
 
-    def test_insert_rows_and_delete(self):
+    def test_insert_and_mutate_rows(self):
         nrows = 100
         table = self.client.table(self.ex_table)
         session = self.client.new_session()
@@ -115,8 +137,25 @@ class TestClient(KuduTestBase, unittest.TestCase):
         # synchronous
         session.flush()
 
+        # Update a row, upsert another one
+        op = table.new_update()
+        op['key'] = 1
+        op['int_val'] = 111
+        op['string_val'] = 'updated'
+        session.apply(op)
+
+        op = table.new_upsert()
+        op['key'] = 2
+        op['int_val'] = 222
+        op['string_val'] = 'upserted'
+        session.apply(op)
+        session.flush()
+
         scanner = table.scanner().open()
-        assert len(scanner.read_all_tuples()) == nrows
+        rows = dict((t[0], t) for t in scanner.read_all_tuples())
+        assert len(rows) == nrows
+        assert rows[1] == (1, 111, 'updated')
+        assert rows[2] == (2, 222, 'upserted')
 
         # Delete the rows we just wrote
         for i in range(nrows):

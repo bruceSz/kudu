@@ -404,6 +404,9 @@ cdef extern from "kudu/client/write_op.h" namespace "kudu::client" nogil:
     cdef cppclass KuduInsert(KuduWriteOperation):
         pass
 
+    cdef cppclass KuduUpsert(KuduWriteOperation):
+        pass
+
     cdef cppclass KuduDelete(KuduWriteOperation):
         pass
 
@@ -483,7 +486,9 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
     cdef cppclass KuduTableCreator:
         KuduTableCreator& table_name(string& name)
         KuduTableCreator& schema(KuduSchema* schema)
-        KuduTableCreator& split_keys(vector[string]& keys)
+        KuduTableCreator& add_hash_partitions(vector[string]& columns, int num_buckets)
+        KuduTableCreator& set_range_partition_columns(vector[string]& columns)
+        KuduTableCreator& split_rows(vector[const KuduPartialRow*]& split_rows)
         KuduTableCreator& num_replicas(int n_replicas)
         KuduTableCreator& wait(c_bool wait)
 
@@ -519,6 +524,7 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         KuduSchema& schema()
 
         KuduInsert* NewInsert()
+        KuduUpsert* NewUpsert()
         KuduUpdate* NewUpdate()
         KuduDelete* NewDelete()
 
@@ -545,6 +551,7 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
         Status Apply(KuduWriteOperation* write_op)
         Status Apply(KuduInsert* write_op)
+        Status Apply(KuduUpsert* write_op)
         Status Apply(KuduUpdate* write_op)
         Status Apply(KuduDelete* write_op)
 
