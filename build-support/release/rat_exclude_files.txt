@@ -26,6 +26,7 @@ java/kudu-client/src/main/java/org/kududb/client/TabletClient.java
 java/kudu-client/src/test/resources/flags
 python/MANIFEST.in
 python/README.md
+python/pytest.ini
 python/requirements.txt
 python/setup.cfg
 src/kudu/client/symbols.map
@@ -165,9 +166,6 @@ src/kudu/util/debug/trace_event_impl.h
 src/kudu/util/debug/trace_event_impl_constants.cc
 src/kudu/util/debug/trace_event_synthetic_delay.cc
 src/kudu/util/debug/trace_event_synthetic_delay.h
-src/kudu/util/memenv/memenv-test.cc
-src/kudu/util/memenv/memenv.cc
-src/kudu/util/memenv/memenv.h
 thirdparty/boost_uuid/boost/uuid/name_generator.hpp
 thirdparty/boost_uuid/boost/uuid/nil_generator.hpp
 thirdparty/boost_uuid/boost/uuid/random_generator.hpp

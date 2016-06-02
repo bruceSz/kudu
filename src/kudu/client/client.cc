@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <boost/bind.hpp>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -55,6 +56,7 @@
 #include "kudu/util/init.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/dns_resolver.h"
+#include "kudu/util/oid_generator.h"
 #include "kudu/util/version_info.h"
 
 using kudu::master::AlterTableRequestPB;
@@ -241,6 +243,8 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
 
 KuduClient::KuduClient()
   : data_(new KuduClient::Data()) {
+  static ObjectIdGenerator oid_generator;
+  data_->client_id_ = oid_generator.Next();
 }
 
 KuduClient::~KuduClient() {
@@ -506,7 +510,7 @@ Status KuduTableCreator::Create() {
   RETURN_NOT_OK_PREPEND(SchemaToPB(*data_->schema_->schema_, req.mutable_schema()),
                         "Invalid schema");
 
-  RowOperationsPBEncoder encoder(req.mutable_split_rows());
+  RowOperationsPBEncoder encoder(req.mutable_split_rows_range_bounds());
 
   for (const KuduPartialRow* row : data_->split_rows_) {
     encoder.Add(RowOperationsPB::SPLIT_ROW, *row);
@@ -711,7 +715,7 @@ void KuduSession::FlushAsync(KuduStatusCallback* user_callback) {
   // Save off the old batcher.
   scoped_refptr<Batcher> old_batcher;
   {
-    lock_guard<simple_spinlock> l(&data_->lock_);
+    std::lock_guard<simple_spinlock> l(data_->lock_);
     data_->NewBatcher(shared_from_this(), &old_batcher);
     InsertOrDie(&data_->flushed_batchers_, old_batcher.get());
   }
@@ -723,7 +727,7 @@ void KuduSession::FlushAsync(KuduStatusCallback* user_callback) {
 }
 
 bool KuduSession::HasPendingOperations() const {
-  lock_guard<simple_spinlock> l(&data_->lock_);
+  std::lock_guard<simple_spinlock> l(data_->lock_);
   if (data_->batcher_->HasPendingOperations()) {
     return true;
   }
@@ -758,7 +762,7 @@ Status KuduSession::Apply(KuduWriteOperation* write_op) {
 }
 
 int KuduSession::CountBufferedOperations() const {
-  lock_guard<simple_spinlock> l(&data_->lock_);
+  std::lock_guard<simple_spinlock> l(data_->lock_);
   CHECK_EQ(data_->flush_mode_, MANUAL_FLUSH);
 
   return data_->batcher_->CountBufferedOperations();
