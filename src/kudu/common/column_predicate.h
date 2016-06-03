@@ -135,18 +135,6 @@ class ColumnPredicate {
   // Predicates over different columns are not equal.
   bool operator==(const ColumnPredicate& other) const;
 
-  // overload operator<< for optional<ColumnPredicate>
-  friend inline std::ostream& operator<<(std::ostream& out, boost::optional<ColumnPredicate> const & v) {
-    if ( out.good() )
-    {
-      if ( !v )
-        out << "--";
-      else out << ' ' << *v ;
-    }
-    return out;
-  }
-
-
   // Returns the raw lower bound value if this is a range predicate, or the
   // equality value if this is an equality predicate.
   const void* raw_lower() const {
