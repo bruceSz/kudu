@@ -110,6 +110,9 @@ class ClusterAdminClient {
   // Delete a single table by name.
   Status DeleteTable(const string& table_name);
 
+  // list tablet server info: uuid, host_port.
+  Status ListTabletServersInfo();
+
  private:
   // Fetch the locations of the replicas for a given tablet from the Master.
   Status GetTabletLocations(const std::string& tablet_id,
@@ -324,7 +327,7 @@ Status ClusterAdminClient::GetFirstRpcAddressForTS(const std::string& uuid, Host
                                      "registered with the Master", uuid));
 }
 
-Statuc ClusterAdminClient::ListTabletServersInfo() {
+Status ClusterAdminClient::ListTabletServersInfo() {
   RepeatedPtrField<ListTabletServersResponsePB::Entry> servers;
   Status s = client.ListTabletServers(&servers);
     
