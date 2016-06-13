@@ -324,7 +324,7 @@ Status ClusterAdminClient::GetFirstRpcAddressForTS(const std::string& uuid, Host
                                      "registered with the Master", uuid));
 }
 
-Statuc ClusterAdminClient::kListTabletServersInfo() {
+Statuc ClusterAdminClient::ListTabletServersInfo() {
   RepeatedPtrField<ListTabletServersResponsePB::Entry> servers;
   Status s = client.ListTabletServers(&servers);
     
@@ -367,6 +367,7 @@ static void SetUsage(const char* argv0) {
               << "<ADD_SERVER|REMOVE_SERVER|CHANGE_ROLE> <peer_uuid> "
               << "[VOTER|NON_VOTER]" << std::endl
       << "  " << kListTablesOp << std::endl
+      << "  " << kListTabletServersInfo << std::endl
       << "  " << kDeleteTableOp << " <table_name>";
   google::SetUsageMessage(str.str());
 }
@@ -424,7 +425,6 @@ static int ClusterAdminCliMain(int argc, char** argv) {
       std::cerr << "Unable to list tablet servers" << s.ToString() << std::endl;
       return 1;
     }
-
     
   } else if (op == kDeleteTableOp) {
     if (argc < 3) {
