@@ -85,6 +85,7 @@ using strings::Substitute;
 const char* const kChangeConfigOp = "change_config";
 const char* const kListTablesOp = "list_tables";
 const char* const kDeleteTableOp = "delete_table";
+const char* const kListTabletServersInfoOp = "list_tablet_servers";
 static const char* g_progname = nullptr;
 
 class ClusterAdminClient {
@@ -323,6 +324,24 @@ Status ClusterAdminClient::GetFirstRpcAddressForTS(const std::string& uuid, Host
                                      "registered with the Master", uuid));
 }
 
+Statuc ClusterAdminClient::kListTabletServersInfo() {
+  RepeatedPtrField<ListTabletServersResponsePB::Entry> servers;
+  Status s = client.ListTabletServers(&servers);
+    
+  for (const ListTabletServersResponsePB::Entry& server : servers) {
+    HostPort host_port;
+    if (!server.has_registration() || server.registration().rpc_addresses_size() == 0) {
+      std::cout << "uuid: " << server.instance_id().permanent_uuid()  
+                << "addr: " << "EMPTY";
+      continue;
+    }
+    RETURN_NOT_OK(HostPortFromPB(server.registration().rpc_addresses(0), hp));
+  
+    std::cout << "uuid: " << server.instance_id().permanent_uuid()
+              << "addr: " << hp.ToString() << std::endl;
+  }
+}
+
 Status ClusterAdminClient::ListTables() {
   vector<string> tables;
   RETURN_NOT_OK(kudu_client_->ListTables(&tables));
@@ -398,6 +417,15 @@ static int ClusterAdminCliMain(int argc, char** argv) {
       std::cerr << "Unable to list tables: " << s.ToString() << std::endl;
       return 1;
     }
+  } else if (op == kListTabletServersInfoOp) {
+
+    Status s = client.ListTabletServersInfo();
+    if (!s.ok()) {
+      std::cerr << "Unable to list tablet servers" << s.ToString() << std::endl;
+      return 1;
+    }
+
+    
   } else if (op == kDeleteTableOp) {
     if (argc < 3) {
       google::ShowUsageWithFlagsRestrict(argv[0], __FILE__);
