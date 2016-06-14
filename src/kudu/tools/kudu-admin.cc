@@ -329,10 +329,10 @@ Status ClusterAdminClient::GetFirstRpcAddressForTS(const std::string& uuid, Host
 
 Status ClusterAdminClient::ListTabletServersInfo() {
   RepeatedPtrField<ListTabletServersResponsePB::Entry> servers;
-  Status s = client.ListTabletServers(&servers);
-    
+  Status s = ListTabletServers(&servers);
+  
   for (const ListTabletServersResponsePB::Entry& server : servers) {
-    HostPort host_port;
+    HostPort hp;
     if (!server.has_registration() || server.registration().rpc_addresses_size() == 0) {
       std::cout << "uuid: " << server.instance_id().permanent_uuid()  
                 << "addr: " << "EMPTY";
