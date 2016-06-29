@@ -339,7 +339,7 @@ Status ClusterAdminClient::ListTabletServersInfo() {
                 << "addr: " << "EMPTY";
       continue;
     }
-    RETURN_NOT_OK(HostPortFromPB(server.registration().rpc_addresses(0), hp));
+    RETURN_NOT_OK(HostPortFromPB(server.registration().rpc_addresses(0), &hp));
   
     std::cout << "uuid: " << server.instance_id().permanent_uuid()
               << "addr: " << hp.ToString() << std::endl;
