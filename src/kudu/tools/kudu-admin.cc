@@ -85,6 +85,7 @@ using strings::Substitute;
 const char* const kChangeConfigOp = "change_config";
 const char* const kListTablesOp = "list_tables";
 const char* const kDeleteTableOp = "delete_table";
+const char* const kListTabletServersInfo = "list_tablet_servers_info";
 const char* const kListTabletServersInfoOp = "list_tablet_servers";
 static const char* g_progname = nullptr;
 
@@ -318,7 +319,7 @@ Status ClusterAdminClient::GetFirstRpcAddressForTS(const std::string& uuid, Host
       if (!server.has_registration() || server.registration().rpc_addresses_size() == 0) {
         break;
       }
-      RETURN_NOT_OK(HostPortFromPB(server.registration().rpc_addresses(0), hp));
+      RETURN_NOT_OK(HostPortFromPB(server.registration().rpc_addresses(0), &hp));
       return Status::OK();
     }
   }
