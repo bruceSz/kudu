@@ -319,7 +319,7 @@ Status ClusterAdminClient::GetFirstRpcAddressForTS(const std::string& uuid, Host
       if (!server.has_registration() || server.registration().rpc_addresses_size() == 0) {
         break;
       }
-      RETURN_NOT_OK(HostPortFromPB(server.registration().rpc_addresses(0), &hp));
+      RETURN_NOT_OK(HostPortFromPB(server.registration().rpc_addresses(0), hp));
       return Status::OK();
     }
   }
