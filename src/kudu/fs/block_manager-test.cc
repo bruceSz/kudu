@@ -700,9 +700,7 @@ class LogBlockManagerTest : public BlockManagerTest<LogBlockManager> {
 // Regression test for KUDU-1190, a crash at startup when a block ID has been
 // reused.
 TEST_F(LogBlockManagerTest, TestReuseBlockIds) {
-  // Set a deterministic random seed, so that we can reproduce the sequence
-  // of random numbers.
-  bm_->rand_.Reset(1);
+  RETURN_NOT_LOG_BLOCK_MANAGER();
   vector<BlockId> block_ids;
 
   // Create 4 containers, with the first four block IDs in the random sequence.
@@ -732,8 +730,9 @@ TEST_F(LogBlockManagerTest, TestReuseBlockIds) {
   }
 
   // Reset the random seed and re-create new blocks which should reuse the same
-  // block IDs (allowed since the blocks were deleted).
-  bm_->rand_.Reset(1);
+  // block IDs. This isn't allowed in current versions of Kudu, but older versions
+  // could produce this situation, and we still need to handle it on startup.
+  bm_->next_block_id_.Store(1);
   for (int i = 0; i < 4; i++) {
     gscoped_ptr<WritableBlock> writer;
     ASSERT_OK(bm_->CreateBlock(&writer));
