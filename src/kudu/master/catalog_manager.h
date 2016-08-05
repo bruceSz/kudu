@@ -350,6 +350,11 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   Status GetTableLocations(const GetTableLocationsRequestPB* req,
                            GetTableLocationsResponsePB* resp);
 
+  // Dumping tablets info.
+  Status DumpTabletsInfoPB(DumpTabletsInfoRequestPB& dump_req,
+                      DumpTabletsInfoResponsePB* tabletsInfo);
+
+  
   // Look up the locations of the given tablet. The locations
   // vector is overwritten (not appended to).
   // If the tablet is not found, returns Status::NotFound.
@@ -473,6 +478,8 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   TableInfo* CreateTableInfo(const CreateTableRequestPB& req,
                              const Schema& schema,
                              const PartitionSchema& partition_schema);
+
+  Status listTabletsInfo(vector<TabletInfoEntryPB>* ties);
 
   // Helper for creating the initial TabletInfo state.
   // Leaves the tablet "write locked" with the new info in the

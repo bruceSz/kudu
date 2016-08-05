@@ -3067,6 +3067,68 @@ Status CatalogManager::GetTabletLocations(const std::string& tablet_id,
   return BuildLocationsForTablet(tablet_info, locs_pb);
 }
 
+Status CatalogManager::DumpTabletsInfoPB(DumpTabletsInfoRequestPB& dump_req,
+                        DumpTabletsInfoResponsePB* resp) {
+  RETURN_NOT_OK(CheckOnline());
+  vector<TabletInfoEntryPB> tabletsInfo;
+  Status s = this->listTabletsInfo(&tabletsInfo);
+  if (!s.ok()) {
+    return s;
+  } else {
+    for (const TabletInfoEntryPB& tie : tabletsInfo) {
+      resp->add_tabletsinfo()->CopyFrom(tie);
+    }
+  }
+  return Status::OK();
+}
+
+Status CatalogManager::listTabletsInfo(vector<TabletInfoEntryPB>* ties) {
+  std::vector<scoped_refptr<TableInfo> > tables;
+  GetAllTables(&tables);
+
+  for (const scoped_refptr<TableInfo>& table : tables) {
+    vector<scoped_refptr<TabletInfo> > tablets;
+    {
+      TableMetadataLock l(table.get(), TableMetadataLock::READ);
+      table->GetAllTablets(&tablets);
+    }
+
+    for (const scoped_refptr<TabletInfo>& tablet : tablets) {
+      TabletInfo::ReplicaMap locations;
+      tablet->GetReplicaLocations(&locations);
+      vector<TabletReplica> sorted_locations;
+      AppendValuesFromMap(locations, &sorted_locations);
+      //std::sort(sorted_locations.begin(), sorted_locations.end(), &CompareByRole);
+
+      TabletMetadataLock l(tablet.get(), TabletMetadataLock::READ);
+
+      Partition partition;
+      Partition::FromPB(l.data().pb.partition(), &partition);
+
+      string state = SysTabletsEntryPB_State_Name(l.data().pb.state());
+      //Capitalize(&state);
+      TabletInfoEntryPB tiePB;
+      tiePB.set_tablet_id(tablet->tablet_id());
+      tiePB.set_table_name(table->ToString());
+      //tiePB.set_partition_schema(partition_schema.PartitionDebugString(partition, schema));
+      tiePB.set_state(state);
+      tiePB.set_message(l.data().pb.state_msg());
+      for (const TabletReplica& location : sorted_locations) {
+				TabletInfoEntryPB::RaftEntry* entry = tiePB.add_entries();
+				entry->set_role(location.role);
+				TSRegistrationPB reg;
+				(*location.ts_desc).GetRegistration(&reg);
+				entry->set_host_name(std::move(std::string(reg.http_addresses(0).host())));
+        
+      }
+			ties->push_back(std::move(tiePB));
+    }
+   
+  }
+  return Status::OK();
+
+}
+
 Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
                                          GetTableLocationsResponsePB* resp) {
   RETURN_NOT_OK(CheckOnline());
