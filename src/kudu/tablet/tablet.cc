@@ -852,7 +852,9 @@ Status Tablet::RewindSchemaForBootstrap(const Schema& new_schema,
   // swap in a new one with the correct schema, rather than attempting
   // to flush.
   LOG_WITH_PREFIX(INFO) << "Rewinding schema during bootstrap to " << new_schema.ToString();
-
+  if (PREDICT_FALSE(!new_schema.has_column_ids())) {
+    return Status::Corruption("schema column id information corrupted: no column id exist");
+  }
   metadata_->SetSchema(new_schema, schema_version);
   {
     std::lock_guard<rw_spinlock> lock(component_lock_);
