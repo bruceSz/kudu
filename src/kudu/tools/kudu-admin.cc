@@ -344,6 +344,7 @@ Status ClusterAdminClient::ListTabletServersInfo() {
     std::cout << "uuid: " << server.instance_id().permanent_uuid()
               << "addr: " << hp.ToString() << std::endl;
   }
+  return Status::OK();
 }
 
 Status ClusterAdminClient::ListTables() {

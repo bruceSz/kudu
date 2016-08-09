@@ -32,6 +32,7 @@
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/master-path-handlers.h"
 #include "kudu/master/ts_manager.h"
+#include "kudu/server/tabletz-path-handler.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/service_if.h"
 #include "kudu/rpc/service_pool.h"
@@ -100,6 +101,7 @@ Status Master::Init() {
 Status Master::Start() {
   RETURN_NOT_OK(StartAsync());
   RETURN_NOT_OK(WaitForCatalogManagerInit());
+  AddTabletzPathHandlers(web_server_.get(), catalog_manager_.get());
   google::FlushLogFiles(google::INFO); // Flush the startup messages.
   return Status::OK();
 }

@@ -70,6 +70,7 @@ set(SERVER_PROCESS_SRCS
   glog_metrics.cc
   pprof-path-handlers.cc
   rpcz-path-handler.cc
+  tabletz-path-handler.cc
   rpc_server.cc
   server_base.cc
   server_base_options.cc

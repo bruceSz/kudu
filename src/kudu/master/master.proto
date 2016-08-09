@@ -565,6 +565,29 @@ message ListMastersResponsePB {
   optional AppStatusPB error = 2;
 }
 
+message DumpTabletsInfoRequestPB {
+  
+}
+
+message TabletInfoEntryPB {
+  
+   message RaftEntry {
+     required consensus.RaftPeerPB.Role role = 1;
+     required string host_name = 2;
+   }
+   required bytes tablet_id = 2;
+   required string table_name = 3;
+   optional string partition_schema = 4;
+   optional string state = 5 ;
+   optional string message = 6;
+   repeated RaftEntry entries = 7;
+}
+
+message DumpTabletsInfoResponsePB {
+   repeated TabletInfoEntryPB tabletsInfo = 1;
+}
+
+
 enum MasterFeatures {
   UNKNOWN_FEATURE = 0;
   // The master supports creating tables with non-covering range partitions.
