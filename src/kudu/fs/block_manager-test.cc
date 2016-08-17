@@ -711,7 +711,7 @@ class LogBlockManagerTest : public BlockManagerTest<LogBlockManager> {
 // Regression test for KUDU-1190, a crash at startup when a block ID has been
 // reused.
 TEST_F(LogBlockManagerTest, TestReuseBlockIds) {
-  RETURN_NOT_LOG_BLOCK_MANAGER();
+  //RETURN_NOT_LOG_BLOCK_MANAGER();
   vector<BlockId> block_ids;
 
   // Create 4 containers, with the first four block IDs in the random sequence.
