@@ -42,6 +42,17 @@ using std::string;
 using std::vector;
 using strings::Substitute;
 
+
+// The LogBlockManager is only supported on Linux, since it requires hole punching.
+#define RETURN_NOT_LOG_BLOCK_MANAGER() \
+  do { \
+    if (FLAGS_block_manager != "log") { \
+      LOG(INFO) << "This platform does not use the log block manager by default. Skipping test."; \
+      return; \
+    } \
+  } while (false)
+
+
 // LogBlockManager opens two files per container, and CloseManyBlocksTest
 // uses one container for each block. To simplify testing (i.e. no need to
 // raise the ulimit on open files), the default is kept low.
