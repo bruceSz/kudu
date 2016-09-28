@@ -66,6 +66,9 @@ class Partition {
     return partition_key_end_;
   }
 
+  // Returns true if the other partition is equivalent to this one.
+  bool Equals(const Partition& other) const;
+
   // Serializes a partition into a protobuf message.
   void ToPB(PartitionPB* pb) const;
 
@@ -178,6 +181,17 @@ class PartitionSchema {
   // Returns a text description of the encoded partition key suitable for debug printing.
   std::string PartitionKeyDebugString(const std::string& key, const Schema& schema) const;
 
+  // Returns a text description of the range partition with the provided
+  // inclusive lower bound and exclusive upper bound.
+  std::string RangePartitionDebugString(const KuduPartialRow& lower_bound,
+                                        const KuduPartialRow& upper_bound) const;
+
+  // Returns a text description of the range partition with the provided
+  // inclusive lower bound and exclusive upper bound.
+  std::string RangePartitionDebugString(const std::string& lower_bound,
+                                        const std::string& upper_bound,
+                                        const Schema& schema) const;
+
   // Returns a text description of the encoded range key suitable for debug printing.
   std::string RangeKeyDebugString(const std::string& range_key, const Schema& schema) const;
 
@@ -191,8 +205,18 @@ class PartitionSchema {
   // Returns true if the other partition schema is equivalent to this one.
   bool Equals(const PartitionSchema& other) const;
 
+  // Transforms an exclusive lower bound range partition key into an inclusive
+  // lower bound range partition key.
+  Status MakeLowerBoundRangePartitionKeyInclusive(KuduPartialRow* row) const;
+
+  // Transforms an inclusive upper bound range partition key into an exclusive
+  // upper bound range partition key.
+  Status MakeUpperBoundRangePartitionKeyExclusive(KuduPartialRow* row) const;
+
  private:
   friend class PartitionPruner;
+  FRIEND_TEST(PartitionTest, TestIncrementRangePartitionBounds);
+  FRIEND_TEST(PartitionTest, TestIncrementRangePartitionStringBounds);
 
   struct RangeSchema {
     std::vector<ColumnId> column_ids;
@@ -237,14 +261,9 @@ class PartitionSchema {
   template<typename Row>
   Status EncodeKeyImpl(const Row& row, string* buf) const;
 
-  // Appends the stringified range partition components of a partial row to a
-  // vector.
-  //
-  // If any columns of the range partition do not exist in the partial row,
-  // processing stops and the provided default string piece is appended to the vector.
-  void AppendRangeDebugStringComponentsOrString(const KuduPartialRow& row,
-                                                StringPiece default_string,
-                                                std::vector<std::string>* components) const;
+  // Returns true if all of the columns in the range partition key are unset in
+  // the row.
+  bool IsRangePartitionKeyEmpty(const KuduPartialRow& row) const;
 
   // Appends the stringified range partition components of a partial row to a
   // vector.
@@ -302,6 +321,11 @@ class PartitionSchema {
   Status SplitRangeBounds(const Schema& schema,
                           std::vector<std::string> splits,
                           std::vector<std::pair<std::string, std::string>>* bounds) const;
+
+  // Increments a range partition key, setting 'increment' to true if the
+  // increment succeeds, or false if all range partition columns are already the
+  // maximum value. Unset columns will be incremented to increment(min_value).
+  Status IncrementRangePartitionKey(KuduPartialRow* row, bool* increment) const;
 
   std::vector<HashBucketSchema> hash_bucket_schemas_;
   RangeSchema range_schema_;

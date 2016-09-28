@@ -17,7 +17,6 @@
 
 #include <memory>
 
-
 #include "kudu/fs/file_block_manager.h"
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/log_block_manager.h"
@@ -42,7 +41,6 @@ using std::string;
 using std::vector;
 using strings::Substitute;
 
-
 // LogBlockManager opens two files per container, and CloseManyBlocksTest
 // uses one container for each block. To simplify testing (i.e. no need to
 // raise the ulimit on open files), the default is kept low.
@@ -51,6 +49,12 @@ DEFINE_int32(num_blocks_close, 500,
 
 DECLARE_uint64(log_container_preallocate_bytes);
 DECLARE_uint64(log_container_max_size);
+
+DECLARE_int64(fs_data_dirs_reserved_bytes);
+DECLARE_int64(disk_reserved_bytes_free_for_testing);
+
+DECLARE_int32(log_block_manager_full_disk_cache_seconds);
+DECLARE_string(block_manager);
 
 // Generic block manager metrics.
 METRIC_DECLARE_gauge_uint64(block_manager_blocks_open_reading);
@@ -74,7 +78,6 @@ METRIC_DECLARE_counter(log_block_manager_full_containers);
       return; \
     } \
   } while (false)
-
 
 namespace kudu {
 namespace fs {
@@ -108,8 +111,6 @@ class BlockManagerTest : public KuduTest {
                             const shared_ptr<MemTracker>& parent_mem_tracker,
                             const vector<string>& paths,
                             bool create) {
-    // Blow away old memtrackers first.
-    bm_.reset();
     bm_.reset(CreateBlockManager(metric_entity, parent_mem_tracker, paths));
     if (create) {
       RETURN_NOT_OK(bm_->Create());
@@ -127,6 +128,13 @@ class BlockManagerTest : public KuduTest {
 
   gscoped_ptr<T> bm_;
 };
+
+template <>
+void BlockManagerTest<LogBlockManager>::SetUp() {
+  RETURN_NOT_LOG_BLOCK_MANAGER();
+  CHECK_OK(bm_->Create());
+  CHECK_OK(bm_->Open());
+}
 
 template <>
 void BlockManagerTest<FileBlockManager>::RunMultipathTest(const vector<string>& paths) {
@@ -515,7 +523,32 @@ TYPED_TEST(BlockManagerTest, WritableBlockStateTest) {
   ASSERT_EQ(WritableBlock::CLOSED, written_block->state());
 }
 
+static void CheckMetrics(const scoped_refptr<MetricEntity>& metrics,
+                         int blocks_open_reading, int blocks_open_writing,
+                         int total_readable_blocks, int total_writable_blocks,
+                         int total_bytes_read, int total_bytes_written) {
+  ASSERT_EQ(blocks_open_reading, down_cast<AtomicGauge<uint64_t>*>(
+                metrics->FindOrNull(METRIC_block_manager_blocks_open_reading).get())->value());
+  ASSERT_EQ(blocks_open_writing, down_cast<AtomicGauge<uint64_t>*>(
+                metrics->FindOrNull(METRIC_block_manager_blocks_open_writing).get())->value());
+  ASSERT_EQ(total_readable_blocks, down_cast<Counter*>(
+                metrics->FindOrNull(METRIC_block_manager_total_readable_blocks).get())->value());
+  ASSERT_EQ(total_writable_blocks, down_cast<Counter*>(
+                metrics->FindOrNull(METRIC_block_manager_total_writable_blocks).get())->value());
+  ASSERT_EQ(total_bytes_read, down_cast<Counter*>(
+                metrics->FindOrNull(METRIC_block_manager_total_bytes_read).get())->value());
+  ASSERT_EQ(total_bytes_written, down_cast<Counter*>(
+                metrics->FindOrNull(METRIC_block_manager_total_bytes_written).get())->value());
+}
+
 TYPED_TEST(BlockManagerTest, AbortTest) {
+  MetricRegistry registry;
+  scoped_refptr<MetricEntity> entity = METRIC_ENTITY_server.Instantiate(&registry, "test");
+  ASSERT_OK(this->ReopenBlockManager(entity,
+                                     shared_ptr<MemTracker>(),
+                                     { GetTestDataDirectory() },
+                                     false));
+
   gscoped_ptr<WritableBlock> written_block;
   ASSERT_OK(this->bm_->CreateBlock(&written_block));
   string test_data = "test data";
@@ -532,6 +565,8 @@ TYPED_TEST(BlockManagerTest, AbortTest) {
   ASSERT_EQ(WritableBlock::CLOSED, written_block->state());
   ASSERT_TRUE(this->bm_->OpenBlock(written_block->id(), nullptr)
               .IsNotFound());
+
+  ASSERT_NO_FATAL_FAILURE(CheckMetrics(entity, 0, 0, 0, 2, 0, test_data.size() * 2));
 }
 
 TYPED_TEST(BlockManagerTest, PersistenceTest) {
@@ -622,24 +657,6 @@ TYPED_TEST(BlockManagerTest, ConcurrentCloseReadableBlockTest) {
   }
 }
 
-static void CheckMetrics(const scoped_refptr<MetricEntity>& metrics,
-                         int blocks_open_reading, int blocks_open_writing,
-                         int total_readable_blocks, int total_writable_blocks,
-                         int total_bytes_read, int total_bytes_written) {
-  ASSERT_EQ(blocks_open_reading, down_cast<AtomicGauge<uint64_t>*>(
-                metrics->FindOrNull(METRIC_block_manager_blocks_open_reading).get())->value());
-  ASSERT_EQ(blocks_open_writing, down_cast<AtomicGauge<uint64_t>*>(
-                metrics->FindOrNull(METRIC_block_manager_blocks_open_writing).get())->value());
-  ASSERT_EQ(total_readable_blocks, down_cast<Counter*>(
-                metrics->FindOrNull(METRIC_block_manager_total_readable_blocks).get())->value());
-  ASSERT_EQ(total_writable_blocks, down_cast<Counter*>(
-                metrics->FindOrNull(METRIC_block_manager_total_writable_blocks).get())->value());
-  ASSERT_EQ(total_bytes_read, down_cast<Counter*>(
-                metrics->FindOrNull(METRIC_block_manager_total_bytes_read).get())->value());
-  ASSERT_EQ(total_bytes_written, down_cast<Counter*>(
-                metrics->FindOrNull(METRIC_block_manager_total_bytes_written).get())->value());
-}
-
 TYPED_TEST(BlockManagerTest, MetricsTest) {
   const string kTestData = "test data";
   MetricRegistry registry;
@@ -702,19 +719,22 @@ TYPED_TEST(BlockManagerTest, MemTrackerTest) {
   ASSERT_NO_FATAL_FAILURE(this->RunMemTrackerTest());
 }
 
-// The LogBlockManager is only supported on Linux, since it requires hole punching.
-#if defined(__linux__)
-// LogBlockManager-specific tests
+// LogBlockManager-specific tests.
 class LogBlockManagerTest : public BlockManagerTest<LogBlockManager> {
 };
 
 // Regression test for KUDU-1190, a crash at startup when a block ID has been
 // reused.
 TEST_F(LogBlockManagerTest, TestReuseBlockIds) {
-  //RETURN_NOT_LOG_BLOCK_MANAGER();
+  RETURN_NOT_LOG_BLOCK_MANAGER();
+
+  // Typically, the LBM starts with a random block ID when running as a
+  // gtest. In this test, we want to control the block IDs.
+  bm_->next_block_id_.Store(1);
+
   vector<BlockId> block_ids;
 
-  // Create 4 containers, with the first four block IDs in the random sequence.
+  // Create 4 containers, with the first four block IDs in the sequence.
   {
     ScopedWritableBlockCloser closer;
     for (int i = 0; i < 4; i++) {
@@ -740,7 +760,7 @@ TEST_F(LogBlockManagerTest, TestReuseBlockIds) {
     ASSERT_OK(bm_->DeleteBlock(b));
   }
 
-  // Reset the random seed and re-create new blocks which should reuse the same
+  // Reset the block ID sequence and re-create new blocks which should reuse the same
   // block IDs. This isn't allowed in current versions of Kudu, but older versions
   // could produce this situation, and we still need to handle it on startup.
   bm_->next_block_id_.Store(1);
@@ -779,6 +799,8 @@ TEST_F(LogBlockManagerTest, TestReuseBlockIds) {
 // Note that we rely on filesystem integrity to ensure that we do not lose
 // trailing, fsync()ed metadata.
 TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
+  RETURN_NOT_LOG_BLOCK_MANAGER();
+
   // Create several blocks.
   vector<BlockId> created_blocks;
   BlockId last_block_id;
@@ -798,6 +820,7 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
 
   string path = LogBlockManager::ContainerPathForTests(bm_->available_containers_.front());
   string metadata_path = path + LogBlockManager::kContainerMetadataFileSuffix;
+  string data_path = path + LogBlockManager::kContainerDataFileSuffix;
 
   uint64_t good_meta_size;
   ASSERT_OK(env_->GetFileSize(metadata_path, &good_meta_size));
@@ -926,10 +949,10 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
   // unsigned integer. This will cause the length field to represent a large
   // value and also cause the length checksum not to validate.
   data[offset + 3] ^= 1 << 7;
-  gscoped_ptr<WritableFile> writable_meta;
-  ASSERT_OK(env_->NewWritableFile(metadata_path, &writable_meta));
-  ASSERT_OK(writable_meta->Append(data));
-  ASSERT_OK(writable_meta->Close());
+  gscoped_ptr<WritableFile> writable_file;
+  ASSERT_OK(env_->NewWritableFile(metadata_path, &writable_file));
+  ASSERT_OK(writable_file->Append(data));
+  ASSERT_OK(writable_file->Close());
 
   // Now try to reopen the container.
   // This should look like a bad checksum, and it's not recoverable.
@@ -939,9 +962,44 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
                                false);
   ASSERT_TRUE(s.IsCorruption());
   ASSERT_STR_CONTAINS(s.ToString(), "Incorrect checksum");
+
+  // Now truncate both the data and metadata files.
+  // This should be recoverable. See KUDU-668.
+  ASSERT_OK(env_->NewWritableFile(metadata_path, &writable_file));
+  ASSERT_OK(writable_file->Close());
+  ASSERT_OK(env_->NewWritableFile(data_path, &writable_file));
+  ASSERT_OK(writable_file->Close());
+
+  ASSERT_OK(this->ReopenBlockManager(scoped_refptr<MetricEntity>(),
+                                     shared_ptr<MemTracker>(),
+                                     { GetTestDataDirectory() },
+                                     false));
 }
 
-#endif // defined(__linux__)
+TEST_F(LogBlockManagerTest, TestDiskSpaceCheck) {
+  RETURN_NOT_LOG_BLOCK_MANAGER();
+
+  FLAGS_log_block_manager_full_disk_cache_seconds = 0; // Don't cache device fullness.
+
+  FLAGS_fs_data_dirs_reserved_bytes = 1; // Keep at least 1 byte reserved in the FS.
+  FLAGS_disk_reserved_bytes_free_for_testing = 0;
+  FLAGS_log_container_preallocate_bytes = 100;
+
+  vector<BlockId> created_blocks;
+  gscoped_ptr<WritableBlock> writer;
+  Status s = bm_->CreateBlock(&writer);
+  ASSERT_TRUE(s.IsIOError());
+  ASSERT_STR_CONTAINS(s.ToString(), "All data directories are full");
+
+  FLAGS_disk_reserved_bytes_free_for_testing = 101;
+  ASSERT_OK(bm_->CreateBlock(&writer));
+
+  FLAGS_disk_reserved_bytes_free_for_testing = 0;
+  s = bm_->CreateBlock(&writer);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+
+  ASSERT_OK(writer->Close());
+}
 
 } // namespace fs
 } // namespace kudu

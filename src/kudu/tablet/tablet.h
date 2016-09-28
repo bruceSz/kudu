@@ -17,7 +17,6 @@
 #ifndef KUDU_TABLET_TABLET_H
 #define KUDU_TABLET_TABLET_H
 
-#include <boost/thread/shared_mutex.hpp>
 #include <iosfwd>
 #include <map>
 #include <memory>
@@ -65,6 +64,7 @@ namespace tablet {
 
 class AlterSchemaTransactionState;
 class CompactionPolicy;
+class HistoryGcOpts;
 class MemRowSet;
 class MvccSnapshot;
 struct RowOp;
@@ -284,7 +284,7 @@ class Tablet {
   Status FlushBiggestDMS();
 
   // Finds the RowSet which has the most separate delta files and
-  // issues a minor delta compaction.
+  // issues a delta compaction.
   Status CompactWorstDeltas(RowSet::DeltaCompactionType type);
 
   // Get the highest performance improvement that would come from compacting the delta stores
@@ -347,6 +347,14 @@ class Tablet {
   Status DoMajorDeltaCompaction(const std::vector<ColumnId>& column_ids,
                                 std::shared_ptr<RowSet> input_rowset);
 
+  // Calculates the ancient history mark and returns true iff tablet history GC
+  // is enabled, which requires the use of a HybridClock.
+  // Otherwise, returns false.
+  bool GetTabletAncientHistoryMark(Timestamp* ancient_history_mark) const WARN_UNUSED_RESULT;
+
+  // Calculates history GC options based on properties of the Clock implementation.
+  HistoryGcOpts GetHistoryGcOpts() const;
+
   // Method used by tests to retrieve all rowsets of this table. This
   // will be removed once code for selecting the appropriate RowSet is
   // finished and delta files is finished is part of Tablet class.
@@ -374,6 +382,8 @@ class Tablet {
   // Throttle a RPC with 'bytes' request size.
   // Return true if this RPC is allowed.
   bool ShouldThrottleAllow(int64_t bytes);
+
+  scoped_refptr<server::Clock> clock() const { return clock_; }
 
   static const char* kDMSMemTrackerId;
  private:
@@ -427,8 +437,9 @@ class Tablet {
   Status PickRowSetsToCompact(RowSetsInCompaction *picked,
                               CompactFlags flags) const;
 
-  Status DoCompactionOrFlush(const RowSetsInCompaction &input,
-                             int64_t mrs_being_flushed);
+  // Performs a merge compaction or a flush.
+  Status DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
+                                  int64_t mrs_being_flushed);
 
   // Handle the case in which a compaction or flush yielded no output rows.
   // In this case, we just need to remove the rowsets in 'rowsets' from the
@@ -456,7 +467,7 @@ class Tablet {
                                  const RowSetVector &to_add);
 
   void GetComponents(scoped_refptr<TabletComponents>* comps) const {
-    boost::shared_lock<rw_spinlock> lock(component_lock_);
+    shared_lock<rw_spinlock> l(component_lock_);
     *comps = components_;
   }
 

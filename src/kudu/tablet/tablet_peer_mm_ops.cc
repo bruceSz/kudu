@@ -24,9 +24,9 @@
 #include <string>
 
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/tablet/maintenance_manager.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/metrics.h"
 
 DEFINE_int32(flush_threshold_mb, 1024,
@@ -173,9 +173,10 @@ void FlushDeltaMemStoresOp::Perform() {
     LOG(WARNING) << "Won't flush deltas since tablet shutting down: " << tablet_peer_->tablet_id();
     return;
   }
-  WARN_NOT_OK(tablet_peer_->tablet()->FlushDMSWithHighestRetention(max_idx_to_segment_size),
-                  Substitute("Failed to flush DMS on $0",
-                             tablet_peer_->tablet()->tablet_id()));
+  KUDU_CHECK_OK_PREPEND(tablet_peer_->tablet()->FlushDMSWithHighestRetention(
+                            max_idx_to_segment_size),
+                        Substitute("Failed to flush DMS on $0",
+                                   tablet_peer_->tablet()->tablet_id()));
   {
     std::lock_guard<simple_spinlock> l(lock_);
     time_since_flush_.start();

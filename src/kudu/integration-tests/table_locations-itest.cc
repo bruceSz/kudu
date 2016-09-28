@@ -61,13 +61,12 @@ class TableLocationsTest : public KuduTest {
 
     cluster_.reset(new MiniCluster(env_.get(), opts));
     ASSERT_OK(cluster_->Start());
-    ASSERT_OK(cluster_->WaitForTabletServerCount(kNumTabletServers));
 
     // Create a client proxy to the master.
     MessengerBuilder bld("Client");
     ASSERT_OK(bld.Build(&client_messenger_));
     proxy_.reset(new MasterServiceProxy(client_messenger_,
-                                        cluster_->leader_mini_master()->bound_rpc_addr()));
+                                        cluster_->mini_master()->bound_rpc_addr()));
   }
 
   void TearDown() override {
@@ -122,18 +121,18 @@ TEST_F(TableLocationsTest, TestGetTableLocations) {
   KuduPartialRow row(&schema);
 
   vector<KuduPartialRow> splits(6, row);
-  ASSERT_OK(splits[0].SetString(0, "aa"));
-  ASSERT_OK(splits[1].SetString(0, "ab"));
-  ASSERT_OK(splits[2].SetString(0, "ac"));
-  ASSERT_OK(splits[3].SetString(0, "ca"));
-  ASSERT_OK(splits[4].SetString(0, "cb"));
-  ASSERT_OK(splits[5].SetString(0, "cc"));
+  ASSERT_OK(splits[0].SetStringNoCopy(0, "aa"));
+  ASSERT_OK(splits[1].SetStringNoCopy(0, "ab"));
+  ASSERT_OK(splits[2].SetStringNoCopy(0, "ac"));
+  ASSERT_OK(splits[3].SetStringNoCopy(0, "ca"));
+  ASSERT_OK(splits[4].SetStringNoCopy(0, "cb"));
+  ASSERT_OK(splits[5].SetStringNoCopy(0, "cc"));
 
   vector<pair<KuduPartialRow, KuduPartialRow>> bounds(2, { row, row });
-  ASSERT_OK(bounds[0].first.SetString(0, "a"));
-  ASSERT_OK(bounds[0].second.SetString(0, "b"));
-  ASSERT_OK(bounds[1].first.SetString(0, "c"));
-  ASSERT_OK(bounds[1].second.SetString(0, "d"));
+  ASSERT_OK(bounds[0].first.SetStringNoCopy(0, "a"));
+  ASSERT_OK(bounds[0].second.SetStringNoCopy(0, "b"));
+  ASSERT_OK(bounds[1].first.SetStringNoCopy(0, "c"));
+  ASSERT_OK(bounds[1].second.SetStringNoCopy(0, "d"));
 
   ASSERT_OK(CreateTable(table_name, schema, splits, bounds));
 

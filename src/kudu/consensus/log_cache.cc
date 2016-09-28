@@ -35,10 +35,10 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/mem_tracker.h"
-#include "kudu/util/metrics.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/mem_tracker.h"
+#include "kudu/util/metrics.h"
 
 DEFINE_int32(log_cache_size_limit_mb, 128,
              "The total per-tablet size of consensus entries which may be kept in memory. "
@@ -80,8 +80,8 @@ LogCache::LogCache(const scoped_refptr<MetricEntity>& metric_entity,
     metrics_(metric_entity) {
 
 
-  const int64_t max_ops_size_bytes = FLAGS_log_cache_size_limit_mb * 1024 * 1024;
-  const int64_t global_max_ops_size_bytes = FLAGS_global_log_cache_size_limit_mb * 1024 * 1024;
+  const int64_t max_ops_size_bytes = FLAGS_log_cache_size_limit_mb * 1024L * 1024L;
+  const int64_t global_max_ops_size_bytes = FLAGS_global_log_cache_size_limit_mb * 1024L * 1024L;
 
   // Set up (or reuse) a tracker with the global limit. It is parented directly
   // to the root tracker so that it's always global.
@@ -104,10 +104,6 @@ LogCache::LogCache(const scoped_refptr<MetricEntity>& metric_entity,
 LogCache::~LogCache() {
   tracker_->Release(tracker_->consumption());
   cache_.clear();
-
-  // Don't need to unregister parent_tracker_ because it is reused in each
-  // LogCache, not duplicated.
-  tracker_->UnregisterFromParent();
 }
 
 void LogCache::Init(const OpId& preceding_op) {
@@ -116,6 +112,27 @@ void LogCache::Init(const OpId& preceding_op) {
     << "Cache should have only our special '0' op";
   next_sequential_op_index_ = preceding_op.index() + 1;
   min_pinned_op_index_ = next_sequential_op_index_;
+}
+
+void LogCache::TruncateOpsAfter(int64_t index) {
+  std::unique_lock<simple_spinlock> l(lock_);
+  TruncateOpsAfterUnlocked(index);
+}
+
+void LogCache::TruncateOpsAfterUnlocked(int64_t index) {
+  int64_t first_to_truncate = index + 1;
+  // If the index is not consecutive then it must be lower than or equal
+  // to the last index, i.e. we're overwriting.
+  CHECK_LE(first_to_truncate, next_sequential_op_index_);
+
+  // Now remove the overwritten operations.
+  for (int64_t i = first_to_truncate; i < next_sequential_op_index_; ++i) {
+    ReplicateRefPtr msg = EraseKeyReturnValuePtr(&cache_, i);
+    if (msg != nullptr) {
+      AccountForMessageRemovalUnlocked(msg);
+    }
+  }
+  next_sequential_op_index_ = index + 1;
 }
 
 Status LogCache::AppendOperations(const vector<ReplicateRefPtr>& msgs,
@@ -131,17 +148,7 @@ Status LogCache::AppendOperations(const vector<ReplicateRefPtr>& msgs,
   int64_t last_idx_in_batch = msgs.back()->get()->id().index();
 
   if (first_idx_in_batch != next_sequential_op_index_) {
-    // If the index is not consecutive then it must be lower than or equal
-    // to the last index, i.e. we're overwriting.
-    CHECK_LE(first_idx_in_batch, next_sequential_op_index_);
-
-    // Now remove the overwritten operations.
-    for (int64_t i = first_idx_in_batch; i < next_sequential_op_index_; ++i) {
-      ReplicateRefPtr msg = EraseKeyReturnValuePtr(&cache_, i);
-      if (msg != nullptr) {
-        AccountForMessageRemovalUnlocked(msg);
-      }
-    }
+    TruncateOpsAfterUnlocked(first_idx_in_batch - 1);
   }
 
 
@@ -191,7 +198,7 @@ Status LogCache::AppendOperations(const vector<ReplicateRefPtr>& msgs,
                callback));
   l.lock();
   if (!log_status.ok()) {
-    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Couldn't append to log: " << log_status.ToString();
+    LOG_WITH_PREFIX_UNLOCKED(ERROR) << "Couldn't append to log: " << log_status.ToString();
     tracker_->Release(mem_required);
     return log_status;
   }
@@ -304,14 +311,16 @@ Status LogCache::ReadOps(int64_t after_op_index,
           next_index, up_to, remaining_space, &raw_replicate_ptrs),
         Substitute("Failed to read ops $0..$1", next_index, up_to));
       l.lock();
-      LOG_WITH_PREFIX_UNLOCKED(INFO) << "Successfully read " << raw_replicate_ptrs.size() << " ops "
-                            << "from disk.";
+      VLOG_WITH_PREFIX_UNLOCKED(2)
+          << "Successfully read " << raw_replicate_ptrs.size() << " ops "
+          << "from disk (" << next_index << ".."
+          << (next_index + raw_replicate_ptrs.size() - 1) << ")";
 
       for (ReplicateMsg* msg : raw_replicate_ptrs) {
         CHECK_EQ(next_index, msg->id().index());
 
         remaining_space -= TotalByteSizeForMessage(*msg);
-        if (remaining_space > 0) {
+        if (remaining_space > 0 || messages->empty()) {
           messages->push_back(make_scoped_refptr_replicate(msg));
           next_index++;
         } else {

@@ -282,7 +282,7 @@ void BlockManagerStressTest<T>::ReaderThread() {
     gscoped_ptr<ReadableBlock> block;
     {
       // Grab a block at random.
-      shared_lock<rw_spinlock> l(&lock_);
+      shared_lock<rw_spinlock> l(lock_);
       size_t num_blocks = written_blocks_.size();
       if (num_blocks > 0) {
         uint32_t next_id = rand.Uniform(num_blocks);
@@ -388,8 +388,6 @@ TYPED_TEST(BlockManagerStressTest, StressTest) {
   LOG(INFO) << "Running on fresh block manager";
   this->RunTest(FLAGS_test_duration_secs / 2);
   LOG(INFO) << "Running on populated block manager";
-  // Blow away old memtrackers before creating new block manager.
-  this->bm_.reset();
   this->bm_.reset(this->CreateBlockManager());
   ASSERT_OK(this->bm_->Open());
   this->RunTest(FLAGS_test_duration_secs / 2);

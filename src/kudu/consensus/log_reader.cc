@@ -60,7 +60,6 @@ struct LogSegmentSeqnoComparator {
 
 using consensus::OpId;
 using consensus::ReplicateMsg;
-using env_util::ReadFully;
 using std::shared_ptr;
 using strings::Substitute;
 
@@ -175,10 +174,8 @@ Status LogReader::Init(const string& tablet_wal_path) {
             "Previous segment: seqno $0, path $1; Current segment: seqno $2, path $3",
             previous_seg_seqno, previous_seg_path,
             entry->header().sequence_number(), entry->path()));
-        previous_seg_seqno++;
-      } else {
-        previous_seg_seqno = entry->header().sequence_number();
       }
+      previous_seg_seqno = entry->header().sequence_number();
       previous_seg_path = entry->path();
       RETURN_NOT_OK(AppendSegmentUnlocked(entry));
     }
@@ -194,29 +191,6 @@ Status LogReader::InitEmptyReaderForTests() {
   return Status::OK();
 }
 
-Status LogReader::GetSegmentPrefixNotIncluding(int64_t index,
-                                               SegmentSequence* segments) const {
-  DCHECK_GE(index, 0);
-  DCHECK(segments);
-  segments->clear();
-
-  std::lock_guard<simple_spinlock> lock(lock_);
-  CHECK_EQ(state_, kLogReaderReading);
-
-  for (const scoped_refptr<ReadableLogSegment>& segment : segments_) {
-    // The last segment doesn't have a footer. Never include that one.
-    if (!segment->HasFooter()) {
-      break;
-    }
-    if (segment->footer().max_replicate_index() >= index) {
-      break;
-    }
-    // TODO: tests for edge cases here with backwards ordered replicates.
-    segments->push_back(segment);
-  }
-
-  return Status::OK();
-}
 
 int64_t LogReader::GetMinReplicateIndex() const {
   std::lock_guard<simple_spinlock> lock(lock_);
@@ -233,32 +207,6 @@ int64_t LogReader::GetMinReplicateIndex() const {
   return min_remaining_op_idx;
 }
 
-void LogReader::GetMaxIndexesToSegmentSizeMap(int64_t min_op_idx, int32_t segments_count,
-                                              int64_t max_close_time_us,
-                                              std::map<int64_t, int64_t>*
-                                              max_idx_to_segment_size) const {
-  std::lock_guard<simple_spinlock> lock(lock_);
-  DCHECK_GE(segments_count, 0);
-  for (const scoped_refptr<ReadableLogSegment>& segment : segments_) {
-    if (max_idx_to_segment_size->size() == segments_count) {
-      break;
-    }
-    DCHECK(segment->HasFooter());
-    if (segment->footer().max_replicate_index() < min_op_idx) {
-      // This means we found a log we can GC. Adjust the expected number of logs.
-      segments_count--;
-      continue;
-    }
-
-    if (max_close_time_us < segment->footer().close_timestamp_micros()) {
-      int64_t age_seconds = segment->footer().close_timestamp_micros() / 1000000;
-      VLOG(2) << "Segment " << segment->path() << " is only " << age_seconds << "s old: "
-          << "won't be counted towards log retention";
-      break;
-    }
-    (*max_idx_to_segment_size)[segment->footer().max_replicate_index()] = segment->file_size();
-  }
-}
 
 scoped_refptr<ReadableLogSegment> LogReader::GetSegmentBySequenceNumber(int64_t seq) const {
   std::lock_guard<simple_spinlock> lock(lock_);
@@ -309,8 +257,8 @@ Status LogReader::ReadBatchUsingIndexEntry(const LogIndexEntry& index_entry,
   return Status::OK();
 }
 
-Status LogReader::ReadReplicatesInRange(const int64_t starting_at,
-                                        const int64_t up_to,
+Status LogReader::ReadReplicatesInRange(int64_t starting_at,
+                                        int64_t up_to,
                                         int64_t max_bytes_to_read,
                                         vector<ReplicateMsg*>* replicates) const {
   DCHECK_GT(starting_at, 0);
@@ -330,7 +278,7 @@ Status LogReader::ReadReplicatesInRange(const int64_t starting_at,
     RETURN_NOT_OK_PREPEND(log_index_->GetEntry(index, &index_entry),
                           Substitute("Failed to read log index for op $0", index));
 
-    // Since a given LogEntryBatch may contain multiple REPLICATE messages,
+    // Since a given LogEntryBatchPB may contain multiple REPLICATE messages,
     // it's likely that this index entry points to the same batch as the previous
     // one. If that's the case, we've already read this REPLICATE and we can
     // skip reading the batch again.

@@ -17,6 +17,7 @@
 
 #include "kudu/consensus/log-test-base.h"
 
+#include <memory>
 #include <vector>
 
 #include "kudu/common/iterator.h"
@@ -33,17 +34,10 @@
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
-
-namespace log {
-
-extern const char* kTestTable;
-extern const char* kTestTablet;
-
-} // namespace log
-
 namespace tablet {
 
 using consensus::ConsensusBootstrapInfo;
@@ -100,15 +94,15 @@ class BootstrapTest : public LogTestBase {
   Status RunBootstrapOnTestTablet(const scoped_refptr<TabletMetadata>& meta,
                                   shared_ptr<Tablet>* tablet,
                                   ConsensusBootstrapInfo* boot_info) {
-    gscoped_ptr<TabletStatusListener> listener(new TabletStatusListener(meta));
     scoped_refptr<LogAnchorRegistry> log_anchor_registry(new LogAnchorRegistry());
     // Now attempt to recover the log
     RETURN_NOT_OK(BootstrapTablet(
         meta,
         scoped_refptr<Clock>(LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
         shared_ptr<MemTracker>(),
+        scoped_refptr<rpc::ResultTracker>(),
         NULL,
-        listener.get(),
+        nullptr, // no status listener
         tablet,
         &log_,
         log_anchor_registry,
@@ -126,11 +120,12 @@ class BootstrapTest : public LogTestBase {
                           "Unable to load test tablet metadata");
 
     consensus::RaftConfigPB config;
-    config.set_local(true);
-    config.add_peers()->set_permanent_uuid(meta->fs_manager()->uuid());
     config.set_opid_index(consensus::kInvalidOpIdIndex);
+    consensus::RaftPeerPB* peer = config.add_peers();
+    peer->set_permanent_uuid(meta->fs_manager()->uuid());
+    peer->set_member_type(consensus::RaftPeerPB::VOTER);
 
-    gscoped_ptr<ConsensusMetadata> cmeta;
+    unique_ptr<ConsensusMetadata> cmeta;
     RETURN_NOT_OK_PREPEND(ConsensusMetadata::Create(meta->fs_manager(), meta->tablet_id(),
                                                     meta->fs_manager()->uuid(),
                                                     config, kMinimumTerm, &cmeta),
@@ -177,8 +172,8 @@ TEST_F(BootstrapTest, TestBootstrap) {
 }
 
 // Tests attempting a local bootstrap of a tablet that was in the middle of a
-// remote bootstrap before "crashing".
-TEST_F(BootstrapTest, TestIncompleteRemoteBootstrap) {
+// tablet copy before "crashing".
+TEST_F(BootstrapTest, TestIncompleteTabletCopy) {
   ASSERT_OK(BuildLog());
 
   ASSERT_OK(PersistTestTabletMetadataState(TABLET_DATA_COPYING));
@@ -248,6 +243,30 @@ TEST_F(BootstrapTest, TestOrphanCommit) {
     ASSERT_EQ("(int32 key=1, int32 int_val=0, string string_val=this is a test insert)",
               results[0]);
     ASSERT_EQ(2, tablet->metadata()->last_durable_mrs_id());
+  }
+}
+
+// Regression test for KUDU-1477: we should successfully start up
+// even if a pending commit contains only failed operations.
+TEST_F(BootstrapTest, TestPendingFailedCommit) {
+  ASSERT_OK(BuildLog());
+
+  OpId opid_1 = MakeOpId(1, current_index_++);
+  OpId opid_2 = MakeOpId(1, current_index_++);
+
+  // Step 2) Write the corresponding COMMIT in the second segment,
+  // with a status indicating that the writes had 'NotFound' results.
+  AppendReplicateBatch(opid_1);
+  AppendReplicateBatch(opid_2);
+  AppendCommitWithNotFoundOpResults(opid_2);
+
+  {
+    shared_ptr<Tablet> tablet;
+    ConsensusBootstrapInfo boot_info;
+
+    // Step 3) Apply the operations in the log to the tablet and flush
+    // the tablet to disk.
+    ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
   }
 }
 

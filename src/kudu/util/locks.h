@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <glog/logging.h>
+#include <mutex>
 
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/dynamic_annotations.h"
@@ -26,7 +27,6 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/spinlock.h"
 #include "kudu/gutil/sysinfo.h"
-#include "kudu/util/errno.h"
 #include "kudu/util/rw_semaphore.h"
 
 namespace kudu {
@@ -158,9 +158,7 @@ class rw_spinlock {
 class percpu_rwlock {
  public:
   percpu_rwlock() {
-    errno = 0;
     n_cpus_ = base::MaxCPUIndex() + 1;
-    CHECK_EQ(errno, 0) << ErrnoToString(errno);
     CHECK_GT(n_cpus_, 0);
     locks_ = new padded_lock[n_cpus_];
   }
@@ -232,18 +230,30 @@ class percpu_rwlock {
 };
 
 // Simple implementation of the std::shared_lock API, which is not available in
-// the standard library until C++17. Defers error checking to the underlying
+// the standard library until C++14. Defers error checking to the underlying
 // mutex.
+
 template <typename Mutex>
 class shared_lock {
  public:
   shared_lock()
-    : m_(NULL) {
+      : m_(nullptr) {
   }
 
-  explicit shared_lock(Mutex* m)
-    : m_(DCHECK_NOTNULL(m)) {
+  explicit shared_lock(Mutex& m)
+      : m_(&m) {
     m_->lock_shared();
+  }
+
+  shared_lock(Mutex& m, std::try_to_lock_t t)
+      : m_(nullptr) {
+    if (m.try_lock_shared()) {
+      m_ = &m;
+    }
+  }
+
+  bool owns_lock() const {
+    return m_;
   }
 
   void swap(shared_lock& other) {
@@ -251,7 +261,7 @@ class shared_lock {
   }
 
   ~shared_lock() {
-    if (m_ != NULL) {
+    if (m_ != nullptr) {
       m_->unlock_shared();
     }
   }

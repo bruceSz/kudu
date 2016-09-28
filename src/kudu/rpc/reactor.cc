@@ -81,7 +81,7 @@ Status ShutdownError(bool aborted) {
 
 ReactorThread::ReactorThread(Reactor *reactor, const MessengerBuilder &bld)
   : loop_(kDefaultLibEvFlags),
-    cur_time_(MonoTime::Now(MonoTime::COARSE)),
+    cur_time_(MonoTime::Now()),
     last_unused_tcp_scan_(cur_time_),
     reactor_(reactor),
     connection_keepalive_time_(bld.connection_keepalive_time_),
@@ -238,7 +238,7 @@ void ReactorThread::TimerHandler(ev::timer &watcher, int revents) {
       "the timer handler.";
     return;
   }
-  MonoTime now(MonoTime::Now(MonoTime::COARSE));
+  MonoTime now(MonoTime::Now());
   VLOG(4) << name() << ": timer tick at " << now.ToString();
   cur_time_ = now;
 
@@ -263,8 +263,8 @@ void ReactorThread::ScanIdleConnections() {
       continue;
     }
 
-    MonoDelta connection_delta(cur_time_.GetDeltaSince(conn->last_activity_time()));
-    if (connection_delta.MoreThan(connection_keepalive_time_)) {
+    MonoDelta connection_delta(cur_time_ - conn->last_activity_time());
+    if (connection_delta > connection_keepalive_time_) {
       conn->Shutdown(Status::NetworkError(
                        StringPrintf("connection timed out after %s seconds",
                                     connection_keepalive_time_.ToString().c_str())));
@@ -353,8 +353,8 @@ Status ReactorThread::StartConnectionNegotiation(const scoped_refptr<Connection>
   DCHECK(IsCurrentThread());
 
   // Set a limit on how long the server will negotiate with a new client.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromMilliseconds(FLAGS_rpc_negotiation_timeout_ms));
+  MonoTime deadline = MonoTime::Now() +
+      MonoDelta::FromMilliseconds(FLAGS_rpc_negotiation_timeout_ms);
 
   scoped_refptr<Trace> trace(new Trace());
   ADOPT_TRACE(trace.get());

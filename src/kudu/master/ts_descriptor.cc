@@ -19,6 +19,7 @@
 
 #include <math.h>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #include "kudu/common/wire_protocol.h"
@@ -27,16 +28,24 @@
 #include "kudu/master/master.pb.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/flag_tags.h"
 
+DEFINE_int32(tserver_unresponsive_timeout_ms, 60 * 1000,
+             "The period of time that a Master can go without receiving a heartbeat from a "
+             "tablet server before considering it unresponsive. Unresponsive servers are not "
+             "selected when assigning replicas during table creation or re-replication.");
+TAG_FLAG(tserver_unresponsive_timeout_ms, advanced);
+
+using std::make_shared;
 using std::shared_ptr;
 
 namespace kudu {
 namespace master {
 
 Status TSDescriptor::RegisterNew(const NodeInstancePB& instance,
-                                 const TSRegistrationPB& registration,
-                                 gscoped_ptr<TSDescriptor>* desc) {
-  gscoped_ptr<TSDescriptor> ret(new TSDescriptor(instance.permanent_uuid()));
+                                 const ServerRegistrationPB& registration,
+                                 shared_ptr<TSDescriptor>* desc) {
+  shared_ptr<TSDescriptor> ret(make_shared<TSDescriptor>(instance.permanent_uuid()));
   RETURN_NOT_OK(ret->Register(instance, registration));
   desc->swap(ret);
   return Status::OK();
@@ -45,24 +54,46 @@ Status TSDescriptor::RegisterNew(const NodeInstancePB& instance,
 TSDescriptor::TSDescriptor(std::string perm_id)
     : permanent_uuid_(std::move(perm_id)),
       latest_seqno_(-1),
-      last_heartbeat_(MonoTime::Now(MonoTime::FINE)),
-      has_tablet_report_(false),
+      last_heartbeat_(MonoTime::Now()),
       recent_replica_creations_(0),
-      last_replica_creations_decay_(MonoTime::Now(MonoTime::FINE)),
+      last_replica_creations_decay_(MonoTime::Now()),
       num_live_replicas_(0) {
 }
 
 TSDescriptor::~TSDescriptor() {
 }
 
+// Compares two repeated HostPortPB fields. Returns true if equal, false otherwise.
+static bool HostPortPBsEqual(const google::protobuf::RepeatedPtrField<HostPortPB>& pb1,
+                             const google::protobuf::RepeatedPtrField<HostPortPB>& pb2) {
+  if (pb1.size() != pb2.size()) {
+    return false;
+  }
+
+  // Do a set-based equality search.
+  std::unordered_set<HostPort, HostPortHasher, HostPortEqualityPredicate> hostports1;
+  std::unordered_set<HostPort, HostPortHasher, HostPortEqualityPredicate> hostports2;
+  for (int i = 0; i < pb1.size(); i++) {
+    HostPort hp1;
+    HostPort hp2;
+    if (!HostPortFromPB(pb1.Get(i), &hp1).ok()) return false;
+    if (!HostPortFromPB(pb2.Get(i), &hp2).ok()) return false;
+    hostports1.insert(hp1);
+    hostports2.insert(hp2);
+  }
+  return hostports1 == hostports2;
+}
+
 Status TSDescriptor::Register(const NodeInstancePB& instance,
-                              const TSRegistrationPB& registration) {
+                              const ServerRegistrationPB& registration) {
   std::lock_guard<simple_spinlock> l(lock_);
   CHECK_EQ(instance.permanent_uuid(), permanent_uuid_);
 
   // TODO(KUDU-418): we don't currently support changing IPs or hosts since the
   // host/port is stored persistently in each tablet's metadata.
-  if (registration_ && registration_->ShortDebugString() != registration.ShortDebugString()) {
+  if (registration_ &&
+      (!HostPortPBsEqual(registration_->rpc_addresses(), registration.rpc_addresses()) ||
+       !HostPortPBsEqual(registration_->http_addresses(), registration.http_addresses()))) {
     string msg = strings::Substitute(
         "Tablet server $0 is attempting to re-register with a different host/port. "
         "This is not currently supported. Old: {$1} New: {$2}",
@@ -71,6 +102,13 @@ Status TSDescriptor::Register(const NodeInstancePB& instance,
         registration.ShortDebugString());
     LOG(ERROR) << msg;
     return Status::InvalidArgument(msg);
+  }
+
+  if (registration.rpc_addresses().empty() ||
+      registration.http_addresses().empty()) {
+    return Status::InvalidArgument(
+        "invalid registration: must have at least one RPC and one HTTP address",
+        registration.ShortDebugString());
   }
 
   if (instance.instance_seqno() < latest_seqno_) {
@@ -87,10 +125,7 @@ Status TSDescriptor::Register(const NodeInstancePB& instance,
   }
 
   latest_seqno_ = instance.instance_seqno();
-  // After re-registering, make the TS re-report its tablets.
-  has_tablet_report_ = false;
-
-  registration_.reset(new TSRegistrationPB(registration));
+  registration_.reset(new ServerRegistrationPB(registration));
   ts_admin_proxy_.reset();
   consensus_proxy_.reset();
 
@@ -99,28 +134,22 @@ Status TSDescriptor::Register(const NodeInstancePB& instance,
 
 void TSDescriptor::UpdateHeartbeatTime() {
   std::lock_guard<simple_spinlock> l(lock_);
-  last_heartbeat_ = MonoTime::Now(MonoTime::FINE);
+  last_heartbeat_ = MonoTime::Now();
 }
 
 MonoDelta TSDescriptor::TimeSinceHeartbeat() const {
-  MonoTime now(MonoTime::Now(MonoTime::FINE));
+  MonoTime now(MonoTime::Now());
   std::lock_guard<simple_spinlock> l(lock_);
-  return now.GetDeltaSince(last_heartbeat_);
+  return now - last_heartbeat_;
+}
+
+bool TSDescriptor::PresumedDead() const {
+  return TimeSinceHeartbeat().ToMilliseconds() >= FLAGS_tserver_unresponsive_timeout_ms;
 }
 
 int64_t TSDescriptor::latest_seqno() const {
   std::lock_guard<simple_spinlock> l(lock_);
   return latest_seqno_;
-}
-
-bool TSDescriptor::has_tablet_report() const {
-  std::lock_guard<simple_spinlock> l(lock_);
-  return has_tablet_report_;
-}
-
-void TSDescriptor::set_has_tablet_report(bool has_report) {
-  std::lock_guard<simple_spinlock> l(lock_);
-  has_tablet_report_ = has_report;
 }
 
 void TSDescriptor::DecayRecentReplicaCreationsUnlocked() {
@@ -129,8 +158,8 @@ void TSDescriptor::DecayRecentReplicaCreationsUnlocked() {
   if (recent_replica_creations_ == 0) return;
 
   const double kHalflifeSecs = 60;
-  MonoTime now = MonoTime::Now(MonoTime::FINE);
-  double secs_since_last_decay = now.GetDeltaSince(last_replica_creations_decay_).ToSeconds();
+  MonoTime now = MonoTime::Now();
+  double secs_since_last_decay = (now - last_replica_creations_decay_).ToSeconds();
   recent_replica_creations_ *= pow(0.5, secs_since_last_decay / kHalflifeSecs);
 
   // If sufficiently small, reset down to 0 to take advantage of the fast path above.
@@ -152,7 +181,7 @@ double TSDescriptor::RecentReplicaCreations() {
   return recent_replica_creations_;
 }
 
-void TSDescriptor::GetRegistration(TSRegistrationPB* reg) const {
+void TSDescriptor::GetRegistration(ServerRegistrationPB* reg) const {
   std::lock_guard<simple_spinlock> l(lock_);
   CHECK(registration_) << "No registration";
   CHECK_NOTNULL(reg)->CopyFrom(*registration_);
@@ -237,6 +266,12 @@ Status TSDescriptor::GetConsensusProxy(const shared_ptr<rpc::Messenger>& messeng
   }
   *proxy = consensus_proxy_;
   return Status::OK();
+}
+
+string TSDescriptor::ToString() const {
+  std::lock_guard<simple_spinlock> l(lock_);
+  const auto& addr = registration_->rpc_addresses(0);
+  return strings::Substitute("$0 ($1:$2)", permanent_uuid_, addr.host(), addr.port());
 }
 
 } // namespace master

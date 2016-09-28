@@ -37,7 +37,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/mini_cluster.h"
 #include "kudu/master/mini_master.h"
-#include "kudu/tablet/maintenance_manager.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_peer.h"
@@ -47,6 +46,7 @@
 #include "kudu/util/async_util.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/errno.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -138,13 +138,6 @@ class FullStackInsertScanTest : public KuduTest {
              .num_replicas(1)
              .Create());
     ASSERT_OK(client_->OpenTable(kTableName, &reader_table_));
-  }
-
-  virtual void TearDown() OVERRIDE {
-    if (cluster_) {
-      cluster_->Shutdown();
-    }
-    KuduTest::TearDown();
   }
 
   void DoConcurrentClientInserts();
@@ -312,11 +305,15 @@ void FullStackInsertScanTest::DoTestScans() {
   LOG(INFO) << "Doing test scans on table of " << kNumRows << " rows.";
 
   gscoped_ptr<Subprocess> stat = MakePerfStat();
+  if (stat) {
+    ASSERT_OK(stat->Start());
+  }
   gscoped_ptr<Subprocess> record = MakePerfRecord();
-  if (stat) stat->Start();
-  if (record) record->Start();
+  if (record) {
+    ASSERT_OK(record->Start());
+  }
 
-  NO_FATALS(ScanProjection(vector<string>(), "empty projection, 0 col"));
+  NO_FATALS(ScanProjection({}, "empty projection, 0 col"));
   NO_FATALS(ScanProjection({ "key" }, "key scan, 1 col"));
   NO_FATALS(ScanProjection(AllColumnNames(), "full schema scan, 10 col"));
   NO_FATALS(ScanProjection(StringColumnNames(), "String projection, 1 col"));

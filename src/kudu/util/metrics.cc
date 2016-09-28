@@ -17,6 +17,7 @@
 #include "kudu/util/metrics.h"
 
 #include <iostream>
+#include <sstream>
 #include <map>
 #include <set>
 
@@ -252,7 +253,7 @@ Status MetricEntity::WriteAsJson(JsonWriter* writer,
 }
 
 void MetricEntity::RetireOldMetrics() {
-  MonoTime now(MonoTime::Now(MonoTime::FINE));
+  MonoTime now(MonoTime::Now());
 
   std::lock_guard<simple_spinlock> l(lock_);
   for (auto it = metric_map_.begin(); it != metric_map_.end();) {
@@ -275,16 +276,15 @@ void MetricEntity::RetireOldMetrics() {
       VLOG(3) << "Metric " << it->first << " has become un-referenced. Will retire after "
               << "the retention interval";
       // This is the first time we've seen this metric as retirable.
-      metric->retire_time_ = now;
-      metric->retire_time_.AddDelta(MonoDelta::FromMilliseconds(
-                                      FLAGS_metrics_retirement_age_ms));
+      metric->retire_time_ =
+          now + MonoDelta::FromMilliseconds(FLAGS_metrics_retirement_age_ms);
       ++it;
       continue;
     }
 
     // If we've already seen this metric in a previous scan, check if it's
     // time to retire it yet.
-    if (now.ComesBefore(metric->retire_time_)) {
+    if (now < metric->retire_time_) {
       VLOG(3) << "Metric " << it->first << " is un-referenced, but still within "
               << "the retention interval";
       ++it;
@@ -415,7 +415,7 @@ void MetricPrototypeRegistry::WriteAsJson(JsonWriter* writer) const {
 }
 
 void MetricPrototypeRegistry::WriteAsJsonAndExit() const {
-  std::stringstream s;
+  std::ostringstream s;
   JsonWriter w(&s, JsonWriter::PRETTY);
   WriteAsJson(&w);
   std::cout << s.str() << std::endl;
@@ -669,14 +669,14 @@ double Histogram::MeanValueForTests() const {
 ScopedLatencyMetric::ScopedLatencyMetric(Histogram* latency_hist)
   : latency_hist_(latency_hist) {
   if (latency_hist_) {
-    time_started_ = MonoTime::Now(MonoTime::FINE);
+    time_started_ = MonoTime::Now();
   }
 }
 
 ScopedLatencyMetric::~ScopedLatencyMetric() {
   if (latency_hist_ != nullptr) {
-    MonoTime time_now = MonoTime::Now(MonoTime::FINE);
-    latency_hist_->Increment(time_now.GetDeltaSince(time_started_).ToMicroseconds());
+    MonoTime time_now = MonoTime::Now();
+    latency_hist_->Increment((time_now - time_started_).ToMicroseconds());
   }
 }
 

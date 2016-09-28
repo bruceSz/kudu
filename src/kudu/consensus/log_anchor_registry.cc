@@ -27,7 +27,6 @@ namespace kudu {
 namespace log {
 
 using consensus::kInvalidOpIdIndex;
-using std::pair;
 using std::string;
 using strings::Substitute;
 using strings::SubstituteAndAppend;
@@ -87,14 +86,14 @@ size_t LogAnchorRegistry::GetAnchorCountForTests() const {
 std::string LogAnchorRegistry::DumpAnchorInfo() const {
   string buf;
   std::lock_guard<simple_spinlock> l(lock_);
-  MonoTime now = MonoTime::Now(MonoTime::FINE);
+  MonoTime now = MonoTime::Now();
   for (const AnchorMultiMap::value_type& entry : anchors_) {
     const LogAnchor* anchor = entry.second;
     DCHECK(anchor->is_registered);
     if (!buf.empty()) buf += ", ";
     SubstituteAndAppend(&buf, "LogAnchor[index=$0, age=$1s, owner=$2]",
                         anchor->log_index,
-                        now.GetDeltaSince(anchor->when_registered).ToSeconds(),
+                        (now - anchor->when_registered).ToSeconds(),
                         anchor->owner);
   }
   return buf;
@@ -109,7 +108,7 @@ void LogAnchorRegistry::RegisterUnlocked(int64_t log_index,
   anchor->log_index = log_index;
   anchor->owner.assign(owner);
   anchor->is_registered = true;
-  anchor->when_registered = MonoTime::Now(MonoTime::FINE);
+  anchor->when_registered = MonoTime::Now();
   AnchorMultiMap::value_type value(log_index, anchor);
   anchors_.insert(value);
 }
@@ -125,9 +124,8 @@ Status LogAnchorRegistry::UnregisterUnlocked(LogAnchor* anchor) {
       anchors_.erase(iter);
       // No need for the iterator to remain valid since we return here.
       return Status::OK();
-    } else {
-      ++iter;
     }
+    ++iter;
   }
   return Status::NotFound(Substitute("Anchor with index $0 and owner $1 not found",
                                      anchor->log_index, anchor->owner));

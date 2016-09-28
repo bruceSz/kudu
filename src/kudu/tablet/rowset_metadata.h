@@ -34,16 +34,12 @@
 
 namespace kudu {
 
-namespace tools {
-class FsTool;
-} // namespace tools
-
 namespace tablet {
 
 class RowSetMetadataUpdate;
 class TabletMetadata;
 
-// Keeps tracks of the RowSet data blocks.
+// Keeps track of the RowSet data blocks.
 //
 // On each tablet MemRowSet flush, a new RowSetMetadata is created,
 // and the DiskRowSetWriter will create and write the "immutable" blocks for
@@ -173,11 +169,12 @@ class RowSetMetadata {
   // On success, calls TabletMetadata::AddOrphanedBlocks() on the removed blocks.
   Status CommitUpdate(const RowSetMetadataUpdate& update);
 
+  void ToProtobuf(RowSetDataPB *pb);
+
   std::vector<BlockId> GetAllBlocks();
 
  private:
   friend class TabletMetadata;
-  friend class kudu::tools::FsTool;
 
   typedef simple_spinlock LockType;
 
@@ -196,8 +193,6 @@ class RowSetMetadata {
   }
 
   Status InitFromPB(const RowSetDataPB& pb);
-
-  void ToProtobuf(RowSetDataPB *pb);
 
   TabletMetadata* const tablet_metadata_;
   bool initted_;

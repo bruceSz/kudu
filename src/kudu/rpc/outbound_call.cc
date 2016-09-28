@@ -19,7 +19,6 @@
 #include <boost/functional/hash.hpp>
 #include <gflags/gflags.h>
 #include <mutex>
-#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -35,16 +34,6 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/kernel_stack_watchdog.h"
 
-namespace kudu {
-namespace rpc {
-
-using google::protobuf::io::CodedOutputStream;
-using google::protobuf::Message;
-using std::set;
-using strings::Substitute;
-
-static const double kMicrosPerSecond = 1000000.0;
-
 // 100M cycles should be about 50ms on a 2Ghz box. This should be high
 // enough that involuntary context switches don't trigger it, but low enough
 // that any serious blocking behavior on the reactor would.
@@ -54,6 +43,14 @@ DEFINE_int64(rpc_callback_max_cycles, 100 * 1000 * 1000,
              " (Advanced debugging option)");
 TAG_FLAG(rpc_callback_max_cycles, advanced);
 TAG_FLAG(rpc_callback_max_cycles, runtime);
+
+namespace kudu {
+namespace rpc {
+
+using google::protobuf::Message;
+using strings::Substitute;
+
+static const double kMicrosPerSecond = 1000000.0;
 
 ///
 /// OutboundCall
@@ -74,10 +71,14 @@ OutboundCall::OutboundCall(const ConnectionId& conn_id,
            << (controller->timeout().Initialized() ? controller->timeout().ToString() : "none");
   header_.set_call_id(kInvalidCallId);
   remote_method.ToPB(header_.mutable_remote_method());
-  start_time_ = MonoTime::Now(MonoTime::FINE);
+  start_time_ = MonoTime::Now();
 
   if (!controller_->required_server_features().empty()) {
     required_rpc_features_.insert(RpcFeatureFlag::APPLICATION_FEATURE_FLAGS);
+  }
+
+  if (controller_->request_id_) {
+    header_.set_allocated_request_id(controller_->request_id_.release());
   }
 }
 
@@ -310,7 +311,7 @@ void OutboundCall::DumpPB(const DumpRunningRpcsRequestPB& req,
   std::lock_guard<simple_spinlock> l(lock_);
   resp->mutable_header()->CopyFrom(header_);
   resp->set_micros_elapsed(
-    MonoTime::Now(MonoTime::FINE) .GetDeltaSince(start_time_).ToMicroseconds());
+      (MonoTime::Now() - start_time_).ToMicroseconds());
 }
 
 ///

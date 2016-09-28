@@ -199,6 +199,9 @@ Status DeltaTracker::CompactStores(int start_idx, int end_idx) {
   //
   // TODO(perf): this could be more fine grained
   std::lock_guard<Mutex> l(compact_flush_lock_);
+
+  // At the time of writing, minor delta compaction only compacts REDO delta
+  // files, so we need at least 2 REDO delta stores to proceed.
   if (CountRedoDeltaStores() <= 1) {
     return Status::OK();
   }
@@ -339,7 +342,7 @@ Status DeltaTracker::Update(Timestamp timestamp,
                             const consensus::OpId& op_id,
                             OperationResultPB* result) {
   // TODO: can probably lock this more fine-grained.
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   DCHECK_LT(row_idx, num_rows_);
 
   Status s = dms_->Update(timestamp, row_idx, update, op_id);
@@ -355,7 +358,7 @@ Status DeltaTracker::Update(Timestamp timestamp,
 
 Status DeltaTracker::CheckRowDeleted(rowid_t row_idx, bool *deleted,
                                      ProbeStats* stats) const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
 
   DCHECK_LT(row_idx, num_rows_);
 
@@ -476,22 +479,22 @@ Status DeltaTracker::Flush(MetadataFlushType flush_type) {
 }
 
 size_t DeltaTracker::DeltaMemStoreSize() const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   return dms_->memory_footprint();
 }
 
 int64_t DeltaTracker::MinUnflushedLogIndex() const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   return dms_->MinLogIndex();
 }
 
 size_t DeltaTracker::CountRedoDeltaStores() const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   return redo_delta_stores_.size();
 }
 
 uint64_t DeltaTracker::EstimateOnDiskSize() const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   uint64_t size = 0;
   for (const shared_ptr<DeltaStore>& ds : redo_delta_stores_) {
     size += ds->EstimateSize();
@@ -500,7 +503,7 @@ uint64_t DeltaTracker::EstimateOnDiskSize() const {
 }
 
 void DeltaTracker::GetColumnIdsWithUpdates(std::vector<ColumnId>* col_ids) const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
 
   set<ColumnId> column_ids_with_updates;
   for (const shared_ptr<DeltaStore>& ds : redo_delta_stores_) {

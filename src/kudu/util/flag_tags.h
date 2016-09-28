@@ -39,9 +39,8 @@
 //         removed at any point. Users should not expect any compatibility
 //         of these flags.
 //
-//         TODO: we should add a new flag like -unlock_experimental_flags
-//         which would be required if the user wants to use any of these,
-//         similar to the JVM's -XX:+UnlockExperimentalVMOptions.
+//         Users must pass --unlock_experimental_flags to use any of these
+//         flags.
 //
 // - "hidden":
 //         These flags are for internal use only (e.g. testing) and should
@@ -59,8 +58,8 @@
 //         happening. These flags are automatically excluded from user-facing
 //         documentation even if they are not also marked 'hidden'.
 //
-//         TODO: we should add a flag -unlock_unsafe_flags which would be required
-//         to use any of these flags.
+//         Users must pass --unlock_unsafe_flags to use any of these
+//         flags.
 //
 // - "runtime":
 //         These flags can be safely changed at runtime via an RPC to the
@@ -133,7 +132,7 @@ struct FlagTags {
 // This also validates that 'tag' is a valid flag as defined in the FlagTags
 // enum above.
 #define TAG_FLAG(flag_name, tag) \
-  COMPILE_ASSERT(sizeof(FLAGS_##flag_name), flag_does_not_exist); \
+  COMPILE_ASSERT(sizeof(decltype(FLAGS_##flag_name)), flag_does_not_exist); \
   COMPILE_ASSERT(sizeof(::kudu::FlagTags::tag), invalid_tag);   \
   namespace {                                                     \
     ::kudu::flag_tags_internal::FlagTagger t_##flag_name##_##tag( \

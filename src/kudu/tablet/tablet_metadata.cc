@@ -153,7 +153,8 @@ void TabletMetadata::CollectBlockIdPBs(const TabletSuperBlockPB& superblock,
 Status TabletMetadata::DeleteTabletData(TabletDataState delete_type,
                                         const boost::optional<OpId>& last_logged_opid) {
   CHECK(delete_type == TABLET_DATA_DELETED ||
-        delete_type == TABLET_DATA_TOMBSTONED)
+        delete_type == TABLET_DATA_TOMBSTONED ||
+        delete_type == TABLET_DATA_COPYING)
       << "DeleteTabletData() called with unsupported delete_type on tablet "
       << tablet_id_ << ": " << TabletDataState_Name(delete_type)
       << " (" << delete_type << ")";
@@ -216,13 +217,13 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id,
                                const TabletDataState& tablet_data_state)
     : state_(kNotWrittenYet),
       tablet_id_(std::move(tablet_id)),
+      table_id_(std::move(table_id)),
       partition_(std::move(partition)),
       fs_manager_(fs_manager),
       next_rowset_idx_(0),
       last_durable_mrs_id_(kNoDurableMemStore),
       schema_(new Schema(schema)),
       schema_version_(0),
-      table_id_(std::move(table_id)),
       table_name_(std::move(table_name)),
       partition_schema_(std::move(partition_schema)),
       tablet_data_state_(tablet_data_state),
@@ -280,7 +281,6 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
                                 superblock.DebugString());
     }
 
-    table_id_ = superblock.table_id();
     last_durable_mrs_id_ = superblock.last_durable_mrs_id();
 
     table_name_ = superblock.table_name();
@@ -292,25 +292,34 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
                           superblock.ShortDebugString());
     SetSchemaUnlocked(std::move(schema), schema_version);
 
-    // This check provides backwards compatibility with the
-    // flexible-partitioning changes introduced in KUDU-818.
-    if (superblock.has_partition()) {
+    if (!superblock.has_partition()) {
+      // KUDU-818: Possible backward compatibility issue with tables created
+      // with version <= 0.5, throw warning.
+      LOG_WITH_PREFIX(WARNING) << "Upgrading from Kudu 0.5.0 directly to this"
+          << " version is not supported. Please upgrade to 0.6.0 before"
+          << " moving to a higher version.";
+      return Status::NotFound("Missing partition in superblock "+
+                              superblock.DebugString());
+    }
+
+    // Some metadata fields are assumed to be immutable and thus are
+    // only read from the protobuf when the tablet metadata is loaded
+    // for the very first time. See KUDU-1500 for more details.
+    if (state_ == kNotLoadedYet) {
+      table_id_ = superblock.table_id();
       RETURN_NOT_OK(PartitionSchema::FromPB(superblock.partition_schema(),
                                             *schema_, &partition_schema_));
       Partition::FromPB(superblock.partition(), &partition_);
     } else {
-      // This clause may be removed after compatibility with tables created
-      // before KUDU-818 is not needed.
-      RETURN_NOT_OK(PartitionSchema::FromPB(PartitionSchemaPB(), *schema_, &partition_schema_));
-      PartitionPB partition;
-      if (!superblock.has_start_key() || !superblock.has_end_key()) {
-        return Status::Corruption(
-            "tablet superblock must contain either a partition or start and end primary keys",
-            superblock.ShortDebugString());
-      }
-      partition.set_partition_key_start(superblock.start_key());
-      partition.set_partition_key_end(superblock.end_key());
-      Partition::FromPB(partition, &partition_);
+      CHECK_EQ(table_id_, superblock.table_id());
+      PartitionSchema partition_schema;
+      RETURN_NOT_OK(PartitionSchema::FromPB(superblock.partition_schema(),
+                                            *schema_, &partition_schema));
+      CHECK(partition_schema_.Equals(partition_schema));
+
+      Partition partition;
+      Partition::FromPB(superblock.partition(), &partition);
+      CHECK(partition_.Equals(partition));
     }
 
     tablet_data_state_ = superblock.tablet_data_state();

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <gflags/gflags.h>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -26,7 +27,6 @@
 
 #include "kudu/consensus/consensus.h"
 #include "kudu/consensus/consensus_meta.h"
-#include "kudu/consensus/local_consensus.h"
 #include "kudu/consensus/log.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid_util.h"
@@ -37,6 +37,10 @@
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/sysinfo.h"
+#include "kudu/rpc/messenger.h"
+#include "kudu/rpc/remote_method.h"
+#include "kudu/rpc/rpc_service.h"
+#include "kudu/rpc/service_pool.h"
 #include "kudu/tablet/transactions/transaction_driver.h"
 #include "kudu/tablet/transactions/alter_schema_transaction.h"
 #include "kudu/tablet/transactions/write_transaction.h"
@@ -83,7 +87,6 @@ using consensus::ConsensusBootstrapInfo;
 using consensus::ConsensusMetadata;
 using consensus::ConsensusOptions;
 using consensus::ConsensusRound;
-using consensus::LocalConsensus;
 using consensus::OpId;
 using consensus::RaftConfigPB;
 using consensus::RaftPeerPB;
@@ -93,6 +96,7 @@ using consensus::WRITE_OP;
 using log::Log;
 using log::LogAnchorRegistry;
 using rpc::Messenger;
+using rpc::ResultTracker;
 using strings::Substitute;
 using tserver::TabletServerErrorPB;
 
@@ -107,7 +111,7 @@ TabletPeer::TabletPeer(const scoped_refptr<TabletMetadata>& meta,
       tablet_id_(meta->tablet_id()),
       local_peer_pb_(local_peer_pb),
       state_(NOT_STARTED),
-      status_listener_(new TabletStatusListener(meta)),
+      last_status_("Tablet initializing..."),
       apply_pool_(apply_pool),
       log_anchor_registry_(new LogAnchorRegistry()),
       mark_dirty_clbk_(std::move(mark_dirty_clbk)) {}
@@ -124,6 +128,7 @@ TabletPeer::~TabletPeer() {
 Status TabletPeer::Init(const shared_ptr<Tablet>& tablet,
                         const scoped_refptr<server::Clock>& clock,
                         const shared_ptr<Messenger>& messenger,
+                        const scoped_refptr<ResultTracker>& result_tracker,
                         const scoped_refptr<Log>& log,
                         const scoped_refptr<MetricEntity>& metric_entity) {
 
@@ -145,35 +150,27 @@ Status TabletPeer::Init(const shared_ptr<Tablet>& tablet,
     clock_ = clock;
     messenger_ = messenger;
     log_ = log;
+    result_tracker_ = result_tracker;
 
     ConsensusOptions options;
     options.tablet_id = meta_->tablet_id();
 
     TRACE("Creating consensus instance");
 
-    gscoped_ptr<ConsensusMetadata> cmeta;
+    unique_ptr<ConsensusMetadata> cmeta;
     RETURN_NOT_OK(ConsensusMetadata::Load(meta_->fs_manager(), tablet_id_,
                                           meta_->fs_manager()->uuid(), &cmeta));
 
-    if (cmeta->committed_config().local()) {
-      consensus_.reset(new LocalConsensus(options,
-                                          std::move(cmeta),
-                                          meta_->fs_manager()->uuid(),
-                                          clock_,
-                                          this,
-                                          log_.get()));
-    } else {
-      consensus_ = RaftConsensus::Create(options,
-                                         std::move(cmeta),
-                                         local_peer_pb_,
-                                         metric_entity,
-                                         clock_,
-                                         this,
-                                         messenger_,
-                                         log_.get(),
-                                         tablet_->mem_tracker(),
-                                         mark_dirty_clbk_);
-    }
+    consensus_ = RaftConsensus::Create(options,
+                                       std::move(cmeta),
+                                       local_peer_pb_,
+                                       metric_entity,
+                                       clock_,
+                                       this,
+                                       messenger_,
+                                       log_.get(),
+                                       tablet_->mem_tracker(),
+                                       mark_dirty_clbk_);
   }
 
   if (tablet_->metrics() != nullptr) {
@@ -293,7 +290,7 @@ Status TabletPeer::CheckRunning() const {
 }
 
 Status TabletPeer::WaitUntilConsensusRunning(const MonoDelta& timeout) {
-  MonoTime start(MonoTime::Now(MonoTime::FINE));
+  MonoTime start(MonoTime::Now());
 
   int backoff_exp = 0;
   const int kMaxBackoffExp = 8;
@@ -315,9 +312,9 @@ Status TabletPeer::WaitUntilConsensusRunning(const MonoDelta& timeout) {
     if (cached_state == RUNNING && has_consensus && consensus_->IsRunning()) {
       break;
     }
-    MonoTime now(MonoTime::Now(MonoTime::FINE));
-    MonoDelta elapsed(now.GetDeltaSince(start));
-    if (elapsed.MoreThan(timeout)) {
+    MonoTime now(MonoTime::Now());
+    MonoDelta elapsed(now - start);
+    if (elapsed > timeout) {
       return Status::TimedOut(Substitute("Consensus is not running after waiting for $0. State; $1",
                                          elapsed.ToString(), TabletStatePB_Name(cached_state)));
     }
@@ -330,10 +327,12 @@ Status TabletPeer::WaitUntilConsensusRunning(const MonoDelta& timeout) {
 Status TabletPeer::SubmitWrite(unique_ptr<WriteTransactionState> state) {
   RETURN_NOT_OK(CheckRunning());
 
+  state->SetResultTracker(result_tracker_);
   gscoped_ptr<WriteTransaction> transaction(new WriteTransaction(std::move(state),
                                                                  consensus::LEADER));
   scoped_refptr<TransactionDriver> driver;
-  RETURN_NOT_OK(NewLeaderTransactionDriver(transaction.PassAs<Transaction>(), &driver));
+  RETURN_NOT_OK(NewLeaderTransactionDriver(transaction.PassAs<Transaction>(),
+                                           &driver));
   return driver->ExecuteAsync();
 }
 
@@ -350,11 +349,10 @@ Status TabletPeer::SubmitAlterSchema(unique_ptr<AlterSchemaTransactionState> sta
 void TabletPeer::GetTabletStatusPB(TabletStatusPB* status_pb_out) const {
   std::lock_guard<simple_spinlock> lock(lock_);
   DCHECK(status_pb_out != nullptr);
-  DCHECK(status_listener_.get() != nullptr);
-  status_pb_out->set_tablet_id(status_listener_->tablet_id());
-  status_pb_out->set_table_name(status_listener_->table_name());
-  status_pb_out->set_last_status(status_listener_->last_status());
-  status_listener_->partition().ToPB(status_pb_out->mutable_partition());
+  status_pb_out->set_tablet_id(meta_->tablet_id());
+  status_pb_out->set_table_name(meta_->table_name());
+  status_pb_out->set_last_status(last_status_);
+  meta_->partition().ToPB(status_pb_out->mutable_partition());
   status_pb_out->set_state(state_);
   status_pb_out->set_tablet_data_state(meta_->tablet_data_state());
   if (tablet_) {
@@ -366,15 +364,31 @@ Status TabletPeer::RunLogGC() {
   if (!CheckRunning().ok()) {
     return Status::OK();
   }
-  int64_t min_log_index;
   int32_t num_gced;
-  GetEarliestNeededLogIndex(&min_log_index);
-  Status s = log_->GC(min_log_index, &num_gced);
+  log::RetentionIndexes retention = GetRetentionIndexes();
+  Status s = log_->GC(retention, &num_gced);
   if (!s.ok()) {
     s = s.CloneAndPrepend("Unexpected error while running Log GC from TabletPeer");
     LOG(ERROR) << s.ToString();
   }
   return Status::OK();
+}
+
+void TabletPeer::StatusMessage(const std::string& status) {
+  std::lock_guard<simple_spinlock> lock(lock_);
+  last_status_ = status;
+}
+
+string TabletPeer::last_status() const {
+  std::lock_guard<simple_spinlock> lock(lock_);
+  return last_status_;
+}
+
+void TabletPeer::SetFailed(const Status& error) {
+  std::lock_guard<simple_spinlock> lock(lock_);
+  state_ = FAILED;
+  error_ = error;
+  last_status_ = error.ToString();
 }
 
 string TabletPeer::HumanReadableState() const {
@@ -385,7 +399,7 @@ string TabletPeer::HumanReadableState() const {
     return Substitute("$0 ($1): $2", TabletStatePB_Name(state_),
                       TabletDataState_Name(data_state),
                       error_.ToString());
-  // If it's remotely bootstrapping, or tombstoned, that is the important thing
+  // If it's copying, or tombstoned, that is the important thing
   // to show.
   } else if (data_state != TABLET_DATA_READY) {
     return TabletDataState_Name(data_state);
@@ -413,7 +427,7 @@ void TabletPeer::GetInFlightTransactions(Transaction::TraceType trace_type,
       }
       status_pb.set_description(driver->ToString());
       int64_t running_for_micros =
-          MonoTime::Now(MonoTime::FINE).GetDeltaSince(driver->start_time()).ToMicroseconds();
+          (MonoTime::Now() - driver->start_time()).ToMicroseconds();
       status_pb.set_running_for_micros(running_for_micros);
       if (trace_type == Transaction::TRACE_TXNS) {
         status_pb.set_trace_buffer(driver->trace()->DumpToString());
@@ -423,18 +437,15 @@ void TabletPeer::GetInFlightTransactions(Transaction::TraceType trace_type,
   }
 }
 
-void TabletPeer::GetEarliestNeededLogIndex(int64_t* min_index) const {
-  // First, we anchor on the last OpId in the Log to establish a lower bound
-  // and avoid racing with the other checks. This limits the Log GC candidate
-  // segments before we check the anchors.
-  {
-    OpId last_log_op;
-    log_->GetLatestEntryOpId(&last_log_op);
-    *min_index = last_log_op.index();
-  }
+log::RetentionIndexes TabletPeer::GetRetentionIndexes() const {
+  // Let consensus set a minimum index that should be anchored.
+  // This ensures that we:
+  //   (a) don't GC any operations which are still in flight
+  //   (b) don't GC any operations that are needed to catch up lagging peers.
+  log::RetentionIndexes ret = consensus_->GetRetentionIndexes();
 
   // If we never have written to the log, no need to proceed.
-  if (*min_index == 0) return;
+  if (ret.for_durability == 0) return ret;
 
   // Next, we interrogate the anchor registry.
   // Returns OK if minimum known, NotFound if no anchors are registered.
@@ -444,7 +455,7 @@ void TabletPeer::GetEarliestNeededLogIndex(int64_t* min_index) const {
     if (PREDICT_FALSE(!s.ok())) {
       DCHECK(s.IsNotFound()) << "Unexpected error calling LogAnchorRegistry: " << s.ToString();
     } else {
-      *min_index = std::min(*min_index, min_anchor_index);
+      ret.for_durability = std::min(ret.for_durability, min_anchor_index);
     }
   }
 
@@ -456,24 +467,23 @@ void TabletPeer::GetEarliestNeededLogIndex(int64_t* min_index) const {
     // A transaction which doesn't have an opid hasn't been submitted for replication yet and
     // thus has no need to anchor the log.
     if (tx_op_id.IsInitialized()) {
-      *min_index = std::min(*min_index, tx_op_id.index());
+      ret.for_durability = std::min(ret.for_durability, tx_op_id.index());
     }
   }
+
+  return ret;
 }
 
 Status TabletPeer::GetMaxIndexesToSegmentSizeMap(MaxIdxToSegmentSizeMap* idx_size_map) const {
   RETURN_NOT_OK(CheckRunning());
-  int64_t min_op_idx;
-  GetEarliestNeededLogIndex(&min_op_idx);
-  log_->GetMaxIndexesToSegmentSizeMap(min_op_idx, idx_size_map);
+  log::RetentionIndexes retention = GetRetentionIndexes();
+  log_->GetMaxIndexesToSegmentSizeMap(retention.for_durability, idx_size_map);
   return Status::OK();
 }
 
 Status TabletPeer::GetGCableDataSize(int64_t* retention_size) const {
   RETURN_NOT_OK(CheckRunning());
-  int64_t min_op_idx;
-  GetEarliestNeededLogIndex(&min_op_idx);
-  log_->GetGCableDataSize(min_op_idx, retention_size);
+  log_->GetGCableDataSize(GetRetentionIndexes(), retention_size);
   return Status::OK();
 }
 
@@ -494,7 +504,11 @@ Status TabletPeer::StartReplicaTransaction(const scoped_refptr<ConsensusRound>& 
       DCHECK(replicate_msg->has_write_request()) << "WRITE_OP replica"
           " transaction must receive a WriteRequestPB";
       unique_ptr<WriteTransactionState> tx_state(
-          new WriteTransactionState(this, &replicate_msg->write_request()));
+          new WriteTransactionState(
+              this,
+              &replicate_msg->write_request(),
+              replicate_msg->has_request_id() ? &replicate_msg->request_id() : nullptr));
+      tx_state->SetResultTracker(result_tracker_);
 
       transaction.reset(new WriteTransaction(std::move(tx_state), consensus::REPLICA));
       break;

@@ -29,6 +29,7 @@
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/consensus_meta.h"
 #include "kudu/consensus/consensus_queue.h"
+#include "kudu/consensus/raft_consensus_state.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/failure_detector.h"
 
@@ -55,7 +56,6 @@ class ConsensusMetadata;
 class Peer;
 class PeerProxyFactory;
 class PeerManager;
-class ReplicaState;
 struct ElectionResult;
 
 class RaftConsensus : public Consensus,
@@ -65,7 +65,7 @@ class RaftConsensus : public Consensus,
 
   static scoped_refptr<RaftConsensus> Create(
     const ConsensusOptions& options,
-    gscoped_ptr<ConsensusMetadata> cmeta,
+    std::unique_ptr<ConsensusMetadata> cmeta,
     const RaftPeerPB& local_peer_pb,
     const scoped_refptr<MetricEntity>& metric_entity,
     const scoped_refptr<server::Clock>& clock,
@@ -76,7 +76,7 @@ class RaftConsensus : public Consensus,
     const Callback<void(const std::string& reason)>& mark_dirty_clbk);
 
   RaftConsensus(const ConsensusOptions& options,
-                gscoped_ptr<ConsensusMetadata> cmeta,
+                std::unique_ptr<ConsensusMetadata> cmeta,
                 gscoped_ptr<PeerProxyFactory> peer_proxy_factory,
                 gscoped_ptr<PeerMessageQueue> queue,
                 gscoped_ptr<PeerManager> peer_manager,
@@ -102,6 +102,8 @@ class RaftConsensus : public Consensus,
   virtual Status EmulateElection() OVERRIDE;
 
   virtual Status StartElection(ElectionMode mode) OVERRIDE;
+
+  virtual Status WaitUntilLeaderForTests(const MonoDelta& timeout) OVERRIDE;
 
   virtual Status StepDown(LeaderStepDownResponsePB* resp) OVERRIDE;
 
@@ -149,19 +151,25 @@ class RaftConsensus : public Consensus,
   // can cause consensus to deadlock.
   ReplicaState* GetReplicaStateForTests();
 
+  virtual Status GetLastOpId(OpIdType type, OpId* id) OVERRIDE;
+
+
+  //------------------------------------------------------------
+  // PeerMessageQueueObserver implementation
+  //------------------------------------------------------------
+
   // Updates the committed_index and triggers the Apply()s for whatever
   // transactions were pending.
   // This is idempotent.
-  void UpdateMajorityReplicated(const OpId& majority_replicated,
-                                OpId* committed_index) OVERRIDE;
+  void NotifyCommitIndex(int64_t commit_index) override;
 
-  virtual void NotifyTermChange(int64_t term) OVERRIDE;
+  void NotifyTermChange(int64_t term) override;
 
-  virtual void NotifyFailedFollower(const std::string& uuid,
-                                    int64_t term,
-                                    const std::string& reason) OVERRIDE;
+  void NotifyFailedFollower(const std::string& uuid,
+                            int64_t term,
+                            const std::string& reason) override;
 
-  virtual Status GetLastOpId(OpIdType type, OpId* id) OVERRIDE;
+  log::RetentionIndexes GetRetentionIndexes() override;
 
  protected:
   // Trigger that a non-Transaction ConsensusRound has finished replication.
@@ -174,7 +182,7 @@ class RaftConsensus : public Consensus,
                                              const StatusCallback& client_cb,
                                              const Status& status);
 
-  // As a leader, append a new ConsensusRond to the queue.
+  // As a leader, append a new ConsensusRound to the queue.
   // Only virtual and protected for mocking purposes.
   virtual Status AppendNewRoundToQueueUnlocked(const scoped_refptr<ConsensusRound>& round);
 
@@ -276,6 +284,10 @@ class RaftConsensus : public Consensus,
                                     ConsensusResponsePB* response,
                                     LeaderRequest* deduped_req);
 
+  // Abort any pending operations after the given op index,
+  // and also truncate the LogCache accordingly.
+  void TruncateAndAbortOpsAfterUnlocked(int64_t truncate_after_index);
+
   // Pushes a new Raft configuration to a majority of peers. Contrary to write operations,
   // this actually waits for the commit round to reach a majority of peers, so that we know
   // we can proceed. If this returns Status::OK(), a majority of peers have accepted the new
@@ -288,6 +300,10 @@ class RaftConsensus : public Consensus,
   // Begin a replica transaction. If the type of message in 'msg' is not a type
   // that uses transactions, delegates to StartConsensusOnlyRoundUnlocked().
   Status StartReplicaTransactionUnlocked(const ReplicateRefPtr& msg);
+
+  // Returns OK and sets 'single_voter' if this node is the only voter in the
+  // Raft configuration.
+  Status IsSingleVoterConfig(bool* single_voter) const;
 
   // Return header string for RequestVote log messages. The ReplicaState lock must be held.
   std::string GetRequestVoteLogPrefixUnlocked() const;
@@ -323,7 +339,7 @@ class RaftConsensus : public Consensus,
                                                 VoteResponsePB* response);
 
   // Respond to VoteRequest that the candidate's last-logged OpId is too old.
-  Status RequestVoteRespondLastOpIdTooOld(const OpId& local_last_opid,
+  Status RequestVoteRespondLastOpIdTooOld(const OpId& local_last_logged_opid,
                                           const VoteRequestPB* request,
                                           VoteResponsePB* response);
 
@@ -340,9 +356,6 @@ class RaftConsensus : public Consensus,
   // Respond to VoteRequest that the vote is granted for candidate.
   Status RequestVoteRespondVoteGranted(const VoteRequestPB* request,
                                        VoteResponsePB* response);
-
-  void UpdateMajorityReplicatedUnlocked(const OpId& majority_replicated,
-                                        OpId* committed_index);
 
   // Callback for leader election driver. ElectionCallback is run on the
   // reactor thread, so it simply defers its work to DoElectionCallback.
@@ -392,7 +405,10 @@ class RaftConsensus : public Consensus,
   Status IncrementTermUnlocked();
 
   // Handle when the term has advanced beyond the current term.
-  Status HandleTermAdvanceUnlocked(ConsensusTerm new_term);
+  //
+  // 'flush' may be used to control whether the term change is flushed to disk.
+  Status HandleTermAdvanceUnlocked(ConsensusTerm new_term,
+                                   ReplicaState::FlushToDisk flush = ReplicaState::FLUSH_TO_DISK);
 
   // Asynchronously (on thread_pool_) notify the tablet peer that the consensus configuration
   // has changed, thus reporting it back to the master.

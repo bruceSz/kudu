@@ -25,13 +25,27 @@ cimport cpython
 from cython.operator cimport dereference as deref
 
 from libkudu_client cimport *
-
 from kudu.compat import tobytes, frombytes
 from kudu.schema cimport Schema, ColumnSchema
 from kudu.errors cimport check_status
+from kudu.util import to_unixtime_micros, from_unixtime_micros
 from errors import KuduException
 
 import six
+
+
+cdef dict _type_names = {
+    KUDU_INT8 : "KUDU_INT8",
+    KUDU_INT16 : "KUDU_INT16",
+    KUDU_INT32 : "KUDU_INT32",
+    KUDU_INT64 : "KUDU_INT64",
+    KUDU_STRING : "KUDU_STRING",
+    KUDU_BOOL : "KUDU_BOOL",
+    KUDU_FLOAT : "KUDU_FLOAT",
+    KUDU_DOUBLE : "KUDU_DOUBLE",
+    KUDU_BINARY : "KUDU_BINARY",
+    KUDU_UNIXTIME_MICROS : "KUDU_UNIXTIME_MICROS"
+}
 
 
 cdef class TimeDelta:
@@ -226,7 +240,7 @@ cdef class Client:
         # Nothing yet to clean up here
         pass
 
-    def create_table(self, table_name, Schema schema, partitioning):
+    def create_table(self, table_name, Schema schema, partitioning, n_replicas=None):
         """
         Creates a new Kudu table from the passed Schema and options.
 
@@ -236,6 +250,8 @@ cdef class Client:
         schema : kudu.Schema
           Create using kudu.schema_builder
         partitioning : Partitioning object
+        n_replicas : int Number of replicas to set. This should be an odd number.
+          If not provided (or if <= 0), falls back to the server-side default.
         """
         cdef:
             KuduTableCreator* c
@@ -245,6 +261,8 @@ cdef class Client:
             c.table_name(tobytes(table_name))
             c.schema(schema.schema)
             self._apply_partitioning(c, partitioning)
+            if n_replicas:
+                c.num_replicas(n_replicas)
             s = c.Create()
             check_status(s)
         finally:
@@ -296,6 +314,22 @@ cdef class Client:
         check_status(self.cp.TableExists(c_name, &exists))
         return exists
 
+    def deserialize_token_into_scanner(self, serialized_token):
+        """
+        Deserializes a ScanToken using the client and returns a scanner.
+
+        Parameters
+        ----------
+        serialized_token : String
+          Serialized form of a ScanToken.
+
+        Returns
+        -------
+        scanner : Scanner
+        """
+        token = ScanToken()
+        return token.deserialize_into_scanner(self, serialized_token)
+
     def table(self, table_name):
         """
         Construct a kudu.Table and retrieve its schema from the cluster.
@@ -346,6 +380,27 @@ cdef class Client:
         result = []
         for i in range(tables.size()):
             result.append(frombytes(tables[i]))
+        return result
+
+    def list_tablet_servers(self):
+        """
+        Retrieve a list of tablet servers currently running in the Kudu cluster
+
+        Returns
+        -------
+        tservers : list[TabletServer]
+          List of TabletServer objects
+        """
+        cdef:
+            vector[KuduTabletServer*] tservers
+            size_t i
+
+        check_status(self.cp.ListTabletServers(&tservers))
+
+        result = []
+        for i in range(tservers.size()):
+            ts = TabletServer()
+            result.append(ts._init(tservers[i]))
         return result
 
     def new_session(self, flush_mode='manual', timeout_ms=5000):
@@ -472,7 +527,41 @@ cdef class StringVal(RawValue):
     def __dealloc__(self):
         del self.val
 
+cdef class UnixtimeMicrosVal(RawValue):
+    cdef:
+        int64_t val
+
+    def __cinit__(self, obj):
+        self.val = to_unixtime_micros(obj)
+        self.data = &self.val
+
 #----------------------------------------------------------------------
+cdef class TabletServer:
+    """
+    Represents a Kudu tablet server, containing the uuid, hostname and port.
+    Create a list of TabletServers by using the kudu.Client.list_tablet_servers
+    method after connecting to a cluster
+    """
+
+    cdef:
+        const KuduTabletServer* _tserver
+
+    cdef _init(self, const KuduTabletServer* tserver):
+        self._tserver = tserver
+        return self
+
+    def __dealloc__(self):
+        if self._tserver != NULL:
+            del self._tserver
+
+    def uuid(self):
+        return frombytes(self._tserver.uuid())
+
+    def hostname(self):
+        return frombytes(self._tserver.hostname())
+
+    def port(self):
+        return self._tserver.port()
 
 
 cdef class Table:
@@ -489,6 +578,7 @@ cdef class Table:
         object _name
         Schema schema
         Client parent
+        int num_replicas
 
     def __cinit__(self, name, Client client):
         self._name = name
@@ -502,6 +592,7 @@ cdef class Table:
         self.schema.schema = &self.ptr().schema()
         self.schema.own_schema = 0
         self.schema.parent = self
+        self.num_replicas = self.ptr().num_replicas()
 
     def __len__(self):
         # TODO: is this cheaply knowable?
@@ -509,7 +600,7 @@ cdef class Table:
 
     def __getitem__(self, key):
         spec = self.schema[key]
-        return Column(self, key, spec)
+        return Column(self, spec)
 
     property name:
 
@@ -589,6 +680,27 @@ cdef class Table:
         result.scanner = new KuduScanner(self.ptr())
         return result
 
+    def scan_token_builder(self):
+        """
+        Create a new ScanTokenBuilder for this table to build a series of
+        scan tokens.
+
+        Examples
+        --------
+        builder = table.scan_token_builder()
+        builder.set_fault_tolerant().add_predicate(table['key'] > 10)
+        tokens = builder.build()
+        for token in tokens:
+            scanner = token.into_kudu_scanner()
+            scanner.open()
+            tuples = scanner.read_all_tuples()
+
+        Returns
+        -------
+        builder : ScanTokenBuilder
+        """
+        return ScanTokenBuilder(self)
+
     cdef inline KuduTable* ptr(self):
         return self.table.get()
 
@@ -611,8 +723,8 @@ cdef class Column:
         Table parent
         ColumnSchema spec
 
-    def __cinit__(self, Table parent, object name, ColumnSchema spec):
-        self.name = tobytes(name)
+    def __cinit__(self, Table parent, ColumnSchema spec):
+        self.name = tobytes(spec.name)
         self.parent = parent
         self.spec = spec
 
@@ -940,6 +1052,11 @@ cdef class Row:
         return cpython.PyBytes_FromStringAndSize(<char*> val.mutable_data(),
                                                  val.size())
 
+    cdef inline get_unixtime_micros(self, int i):
+        cdef int64_t val
+        check_status(self.row.GetUnixTimeMicros(i, &val))
+        return val
+
     cdef inline get_slot(self, int i):
         cdef:
             Status s
@@ -961,8 +1078,11 @@ cdef class Row:
             return self.get_float(i)
         elif t == KUDU_STRING:
             return frombytes(self.get_string(i))
+        elif t == KUDU_UNIXTIME_MICROS:
+            return from_unixtime_micros(self.get_unixtime_micros(i))
         else:
-            raise TypeError(t)
+            raise TypeError("Cannot get kudu type <{0}>"
+                                .format(_type_names[t]))
 
     cdef inline bint is_null(self, int i):
         return self.row.IsNull(i)
@@ -1021,7 +1141,7 @@ cdef class Scanner:
         KuduScanner* scanner
         bint is_open
 
-    def __cinit__(self, Table table):
+    def __cinit__(self, Table table = None):
         self.table = table
         self.scanner = NULL
         self.is_open = 0
@@ -1092,6 +1212,22 @@ cdef class Scanner:
         check_status(self.scanner.SetProjectedColumnNames(v_names))
         return self
 
+    def set_projected_column_indexes(self, indexes):
+        """
+        Sets the columns to be scanned.
+
+        Parameters
+        ----------
+        indexes : list of integers representing column indexes
+
+        Returns
+        -------
+        self : Scanner
+        """
+        cdef vector[int] v_indexes = indexes
+        check_status(self.scanner.SetProjectedColumnIndexes(v_indexes))
+        return self
+
     def set_fault_tolerant(self):
         """
         Makes the underlying KuduScanner fault tolerant.
@@ -1138,6 +1274,22 @@ cdef class Scanner:
         """
         check_status(self.scanner.AddExclusiveUpperBound(deref(bound.row)))
         return self
+
+    def get_projection_schema(self):
+        """
+        Returns the schema of the projection being scanned
+
+        Returns
+        -------
+        schema : kudu.Schema
+        """
+        result = Schema()
+        # Had to instantiate a new schema to return a pointer since the
+        # GetProjectionSchema method does not
+        cdef KuduSchema* schema = new KuduSchema(self.scanner.
+                                                 GetProjectionSchema())
+        result.schema = schema
+        return result
 
     def open(self):
         """
@@ -1193,6 +1345,359 @@ cdef class Scanner:
         check_status(self.scanner.NextBatch(&batch.batch))
         return batch
 
+cdef class ScanToken:
+    """
+    A ScanToken describes a partial scan of a Kudu table limited to a single
+    contiguous physical location. Using the KuduScanTokenBuilder, clients
+    can describe the desired scan, including predicates, bounds, timestamps,
+    and caching, and receive back a collection of scan tokens.
+    """
+    cdef:
+        KuduScanToken* _token
+
+    def __cinit__(self):
+        self._token = NULL
+
+    def __dealloc__(self):
+        if self._token != NULL:
+            del self._token
+
+    cdef _init(self, KuduScanToken* token):
+        self._token = token
+        return self
+
+    def into_kudu_scanner(self):
+        """
+        Returns a scanner under the current client.
+
+        Returns
+        -------
+        scanner : Scanner
+        """
+        cdef:
+            Scanner result = Scanner()
+            KuduScanner* _scanner = NULL
+        check_status(self._token.IntoKuduScanner(&_scanner))
+        result.scanner = _scanner
+        return result
+
+
+    def tablet(self):
+        """
+        Returns the Tablet associated with this ScanToken
+
+        Returns
+        -------
+        tablet : Tablet
+        """
+        tablet = Tablet()
+        return tablet._init(&self._token.tablet())
+
+    def serialize(self):
+        """
+        Serialize token into a string.
+
+        Returns
+        -------
+        serialized_token : string
+        """
+        cdef string buf
+        check_status(self._token.Serialize(&buf))
+        return frombytes(buf)
+
+    def deserialize_into_scanner(self, Client client, serialized_token):
+        """
+        Returns a new scanner from the serialized token created under
+        the provided Client.
+
+        Parameters
+        ----------
+        client : Client
+        serialized_token : string
+
+        Returns
+        -------
+        scanner : Scanner
+        """
+        cdef:
+            Scanner result = Scanner()
+            KuduScanner* _scanner
+        check_status(self._token.DeserializeIntoScanner(client.cp, tobytes(serialized_token), &_scanner))
+        result.scanner = _scanner
+        return result
+
+
+cdef class ScanTokenBuilder:
+    """
+    This class builds ScanTokens for a Table.
+    """
+    cdef:
+        KuduScanTokenBuilder* _builder
+        Table _table
+
+    def __cinit__(self, Table table):
+        self._table = table
+        self._builder = new KuduScanTokenBuilder(table.ptr())
+
+    def __dealloc__(self):
+        if self._builder != NULL:
+            del self._builder
+
+    def set_projected_column_names(self, names):
+        """
+        Sets the columns to be scanned.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        names : list of strings
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef vector[string] v_names
+        for name in names:
+            v_names.push_back(tobytes(name))
+        check_status(self._builder.SetProjectedColumnNames(v_names))
+        return self
+
+    def set_projected_column_indexes(self, indexes):
+        """
+        Sets the columns to be scanned.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        indexes : list of integers representing column indexes
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef vector[int] v_indexes = indexes
+        check_status(self._builder.SetProjectedColumnIndexes(v_indexes))
+        return self
+
+    def set_batch_size_bytes(self, batch_size):
+        """
+        Sets the batch size in bytes.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        batch_size : Size of batch in bytes
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.SetBatchSizeBytes(batch_size))
+        return self
+
+    def set_timout_millis(self, millis):
+        """
+        Sets the timeout in milliseconds.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        millis : int64_t
+          timeout in milliseconds
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.SetTimeoutMillis(millis))
+        return self
+
+    def set_fault_tolerant(self):
+        """
+        Makes the underlying KuduScanner fault tolerant.
+        Returns a reference to itself to facilitate chaining.
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.SetFaultTolerant())
+        return self
+
+    def add_predicates(self, preds):
+        """
+        Add a list of scan predicates to the ScanTokenBuilder. Select columns
+        from the parent table and make comparisons to create predicates.
+
+        Examples
+        --------
+        c = table[col_name]
+        preds = [c >= 0, c <= 10]
+        builder.add_predicates(preds)
+
+        Parameters
+        ----------
+        preds : list of Predicate
+        """
+        for pred in preds:
+            self.add_predicate(pred)
+
+    cpdef add_predicate(self, Predicate pred):
+        """
+        Add a scan predicates to the scan token. Select columns from the
+        parent table and make comparisons to create predicates.
+
+        Examples
+        --------
+        pred = table[col_name] <= 10
+        builder.add_predicate(pred)
+
+        Parameters
+        ----------
+        pred : kudu.Predicate
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        cdef KuduPredicate* clone
+
+        # We clone the KuduPredicate so that the Predicate wrapper class can be
+        # reused
+        clone = pred.pred.Clone()
+        check_status(self._builder.AddConjunctPredicate(clone))
+
+    def new_bound(self):
+        """
+        Returns a new instance of a ScanBound (subclass of PartialRow) to be
+        later set with add_lower_bound()/add_upper_bound().
+
+        Returns
+        -------
+        bound : ScanBound
+        """
+        return ScanBound(self._table)
+
+    def add_lower_bound(self, ScanBound bound):
+        """
+        Sets the lower bound of the scan.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        bound : ScanBound
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.AddLowerBound(deref(bound.row)))
+        return self
+
+    def add_upper_bound(self, ScanBound bound):
+        """
+        Sets the upper bound of the scan.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        bound : ScanBound
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.AddUpperBound(deref(bound.row)))
+        return self
+
+    def set_cache_blocks(self, cache_blocks):
+        """
+        Sets the block caching policy.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        cache_blocks : bool
+
+        Returns
+        -------
+        self : ScanTokenBuilder
+        """
+        check_status(self._builder.SetCacheBlocks(cache_blocks))
+        return self
+
+    def build(self):
+        """
+        Build the set of scan tokens. The builder may be reused after
+        this call. Returns a list of ScanTokens to be serialized and
+        executed in parallel with seperate client instances.
+
+        Returns
+        -------
+        tokens : List[ScanToken]
+        """
+
+        cdef:
+            vector[KuduScanToken*] tokens
+            size_t i
+
+        check_status(self._builder.Build(&tokens))
+
+        result = []
+        for i in range(tokens.size()):
+            token = ScanToken()
+            result.append(token._init(tokens[i]))
+        return result
+
+
+cdef class Tablet:
+    """
+    Represents a remote Tablet. Contains the tablet id and Replicas associated
+    with the Kudu Tablet. Retrieved by the ScanToken.tablet() method.
+    """
+    cdef:
+        const KuduTablet* _tablet
+        vector[KuduReplica*] _replicas
+
+    cdef _init(self, const KuduTablet* tablet):
+        self._tablet = tablet
+        return self
+
+    def id(self):
+        return frombytes(self._tablet.id())
+
+    def replicas(self):
+        cdef size_t i
+
+        result = []
+        _replicas = self._tablet.replicas()
+        for i in range(_replicas.size()):
+            replica = Replica()
+            result.append(replica._init(_replicas[i]))
+        return result
+
+cdef class Replica:
+    """
+    Represents a remote Tablet's replica. Retrieve a list of Replicas with the
+    Tablet.replicas() method. Contains the boolean is_leader and its
+    respective TabletServer object.
+    """
+    cdef const KuduReplica* _replica
+
+    cdef _init(self, const KuduReplica* replica):
+        self._replica = replica
+        return self
+
+    def __dealloc__(self):
+        if self._replica != NULL:
+            del self._replica
+
+    def is_leader(self):
+        return self._replica.is_leader()
+
+    def ts(self):
+        ts = TabletServer()
+        return ts._init(&self._replica.ts())
 
 cdef class KuduError:
 
@@ -1237,6 +1742,11 @@ cdef class PartialRow:
     cpdef set_field(self, key, value):
         cdef:
             int i = self.table.schema.get_loc(key)
+
+        self.set_loc(i, value)
+
+    cpdef set_loc(self, int i, value):
+        cdef:
             DataType t = self.table.schema.loc_type(i)
             cdef Slice* slc
 
@@ -1271,9 +1781,18 @@ cdef class PartialRow:
             # Not safe to take a reference to PyBytes data for now
             self.row.SetStringCopy(i, deref(slc))
             del slc
-
-    cpdef set_loc(self, int i, value):
-        pass
+        elif t == KUDU_UNIXTIME_MICROS:
+            # String with custom format
+            #  eg: ("2016-01-01", "%Y-%m-%d")
+            if type(value) is tuple:
+                self.row.SetUnixTimeMicros(i, <int64_t>
+                    to_unixtime_micros(value[0], value[1]))
+                # datetime.datetime input or string with default format
+            else:
+                self.row.SetUnixTimeMicros(i, <int64_t>
+                    to_unixtime_micros(value))
+        else:
+            raise TypeError("Cannot set kudu type <{0}>.".format(_type_names[t]))
 
     cpdef set_field_null(self, key):
         pass
@@ -1364,5 +1883,7 @@ cdef inline cast_pyvalue(DataType t, object o):
         return FloatVal(o)
     elif t == KUDU_STRING:
         return StringVal(o)
+    elif t == KUDU_UNIXTIME_MICROS:
+        return UnixtimeMicrosVal(o)
     else:
-        raise TypeError(t)
+        raise TypeError("Cannot cast kudu type <{0}>".format(_type_names[t]))

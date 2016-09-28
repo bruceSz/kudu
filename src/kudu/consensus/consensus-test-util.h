@@ -56,7 +56,7 @@ namespace consensus {
 using log::Log;
 using strings::Substitute;
 
-static gscoped_ptr<ReplicateMsg> CreateDummyReplicate(int term,
+inline gscoped_ptr<ReplicateMsg> CreateDummyReplicate(int term,
                                                       int index,
                                                       const Timestamp& timestamp,
                                                       int payload_size) {
@@ -72,7 +72,7 @@ static gscoped_ptr<ReplicateMsg> CreateDummyReplicate(int term,
 }
 
 // Returns RaftPeerPB with given UUID and obviously-fake hostname / port combo.
-RaftPeerPB FakeRaftPeerPB(const std::string& uuid) {
+inline RaftPeerPB FakeRaftPeerPB(const std::string& uuid) {
   RaftPeerPB peer_pb;
   peer_pb.set_permanent_uuid(uuid);
   peer_pb.mutable_last_known_addr()->set_host(Substitute("$0-fake-hostname", CURRENT_TEST_NAME()));
@@ -85,7 +85,7 @@ RaftPeerPB FakeRaftPeerPB(const std::string& uuid) {
 // An operation will only be considered done (TestOperationStatus::IsDone()
 // will become true) once at least 'n_majority' peers have called
 // TestOperationStatus::AckPeer().
-static inline void AppendReplicateMessagesToQueue(
+inline void AppendReplicateMessagesToQueue(
     PeerMessageQueue* queue,
     const scoped_refptr<server::Clock>& clock,
     int first,
@@ -101,9 +101,8 @@ static inline void AppendReplicateMessagesToQueue(
 }
 
 // Builds a configuration of 'num' voters.
-RaftConfigPB BuildRaftConfigPBForTests(int num) {
+inline RaftConfigPB BuildRaftConfigPBForTests(int num) {
   RaftConfigPB raft_config;
-  raft_config.set_local(false);
   for (int i = 0; i < num; i++) {
     RaftPeerPB* peer_pb = raft_config.add_peers();
     peer_pb->set_member_type(RaftPeerPB::VOTER);
@@ -645,7 +644,7 @@ class MockTransactionFactory : public ReplicaTransactionFactory {
 // A transaction factory for tests, usually this is implemented by TabletPeer.
 class TestTransactionFactory : public ReplicaTransactionFactory {
  public:
-  explicit TestTransactionFactory(Log* log) : consensus_(NULL),
+  explicit TestTransactionFactory(Log* log) : consensus_(nullptr),
                                               log_(log) {
 
     CHECK_OK(ThreadPoolBuilder("test-txn-factory").set_max_threads(1).Build(&pool_));
@@ -840,30 +839,6 @@ class CounterHooks : public Consensus::ConsensusFaultHooks {
 
   // Lock that protects updates to the counters.
   mutable simple_spinlock lock_;
-};
-
-class TestRaftConsensusQueueIface : public PeerMessageQueueObserver {
- public:
-  bool IsMajorityReplicated(int64_t index) {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    return index <= majority_replicated_index_;
-  }
-
- protected:
-  virtual void UpdateMajorityReplicated(const OpId& majority_replicated,
-                                        OpId* committed_index) OVERRIDE {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    majority_replicated_index_ = majority_replicated.index();
-    committed_index->CopyFrom(majority_replicated);
-  }
-  virtual void NotifyTermChange(int64_t term) OVERRIDE {}
-  virtual void NotifyFailedFollower(const std::string& uuid,
-                                    int64_t term,
-                                    const std::string& reason) OVERRIDE {}
-
- private:
-  mutable simple_spinlock lock_;
-  int64_t majority_replicated_index_;
 };
 
 }  // namespace consensus
